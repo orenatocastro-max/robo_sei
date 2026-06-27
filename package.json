@@ -1,14 +1,13 @@
 {
-  "name": "robo-sei-niar-render",
-  "version": "1.0.0",
+  "name": "robo-sei-niar",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "start": "node index.js",
-    "run-once": "node index.js --once"
+    "once": "node index.js --once"
   },
   "dependencies": {
-    "@supabase/supabase-js": "latest",
-    "express": "latest",
-    "playwright": "latest"
+    "@supabase/supabase-js": "^2.87.1",
+    "express": "^5.2.1"
   }
 }
