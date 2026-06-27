@@ -1,0 +1,29 @@
+ROBO SEI NIAR - ARQUIVOS NA RAIZ DO REPOSITORIO
+
+Este ZIP foi preparado para resolver o erro do Render:
+Could not read package.json
+
+Como usar:
+1. Descompacte este ZIP.
+2. Abra a pasta robosei_RENDER_RAIZ.
+3. Envie para o GitHub os arquivos que estão DENTRO dessa pasta, diretamente na raiz do repositório robosei.
+4. No GitHub, a primeira tela do repositório deve mostrar:
+   - package.json
+   - index.js
+   - README_RENDER.md
+   - .env.example
+   - LEIA_PRIMEIRO.txt
+5. No Render, deixe Root Directory em branco.
+6. Use:
+   Build Command: npm install
+   Start Command: npm start
+7. Manual Deploy > Clear build cache & deploy.
+
+Variáveis no Render:
+ROBOT_MODE=simulation
+SUPABASE_URL=https://xzdumqnipmomybsydmvf.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=sua_service_role_key
+SEI_URL=link_do_sei
+SEI_USER=seu_usuario
+SEI_PASSWORD=sua_senha
+RUN_INTERVAL_MINUTES=60
