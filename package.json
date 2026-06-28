@@ -1,6 +1,6 @@
 {
   "name": "robo-sei-niar",
-  "version": "11.1.0",
+  "version": "11.2.0",
   "type": "module",
   "scripts": {
     "start": "node index.js",
@@ -10,7 +10,8 @@
   "dependencies": {
     "@supabase/supabase-js": "^2.87.1",
     "express": "^5.2.1",
-    "playwright": "^1.57.0"
+    "playwright": "^1.57.0",
+    "ws": "^8.18.0"
   },
   "engines": {
     "node": "20.x"

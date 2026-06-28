@@ -52,3 +52,15 @@ O retorno deve mostrar:
 ```
 
 Se der erro, envie o print dos Logs do Render.
+
+
+## v11.2 - correção WebSocket no Render
+Esta versão adiciona a dependência `ws` e configura o Supabase Realtime para Node 20 no Render, corrigindo o erro:
+
+`Node.js 20 detected without native WebSocket support.`
+
+Após substituir os arquivos no GitHub, mantenha o Start Command:
+
+`npx playwright install chromium && node index.js`
+
+Depois rode no Render: Manual Deploy > Clear build cache & deploy.
