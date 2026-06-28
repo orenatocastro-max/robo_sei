@@ -382,37 +382,196 @@ async function collectDocumentCandidates(page) {
   return unique.slice(-Math.max(1, SEI_MAX_DOCUMENTS));
 }
 
-async function clickDocumentAndRead(page, candidate) {
-  const label = candidate.text;
-  const frame = candidate.frame;
-  console.log(`[SEI] Abrindo documento: ${label}`);
-  const locs = [
-    frame.getByText(label, { exact: true }).first(),
-    frame.getByText(label, { exact: false }).first(),
-    frame.locator(`text=${label}`).first()
-  ];
-  let clicked = false;
-  for (const loc of locs) {
+function locatorCandidatesForDocument(frame, candidate) {
+  const label = cleanText(candidate.text || '');
+  const parsed = parseDocumentName(label);
+  const id = parsed.id_sei || '';
+  const docName = parsed.documento || label;
+  const tipo = inferDocumentType(docName);
+  const locators = [];
+
+  const push = (loc, name) => locators.push({ loc, name });
+
+  // 1) Texto completo exatamente como aparece na árvore.
+  if (label) push(frame.getByText(label, { exact: true }).first(), 'texto-exato');
+
+  // 2) Texto aproximado do documento.
+  if (docName && docName !== label) push(frame.getByText(docName, { exact: false }).first(), 'nome-documento');
+
+  // 3) Número/ID SEI dentro da árvore.
+  if (id) push(frame.getByText(id, { exact: false }).first(), 'id-sei');
+
+  // 4) Link/âncora que contenha o texto ou o ID.
+  if (label) push(frame.locator('a').filter({ hasText: label }).first(), 'link-com-texto-exato');
+  if (docName) push(frame.locator('a').filter({ hasText: docName }).first(), 'link-com-nome');
+  if (id) push(frame.locator('a').filter({ hasText: id }).first(), 'link-com-id');
+
+  // 5) Elementos de árvore típicos do SEI.
+  if (label) push(frame.locator('[id*=divArvore], [id*=arvore], #divArvore').locator('a, span, div, td').filter({ hasText: label }).first(), 'arvore-texto');
+  if (id) push(frame.locator('[id*=divArvore], [id*=arvore], #divArvore').locator('a, span, div, td').filter({ hasText: id }).first(), 'arvore-id');
+
+  // 6) Busca por tipo + id, útil quando o SEI quebra o texto em nós diferentes.
+  if (tipo && id) push(frame.locator('a, span, div, td').filter({ hasText: new RegExp(`${tipo}.*${id}|${id}.*${tipo}`, 'i') }).first(), 'tipo-e-id');
+
+  return locators;
+}
+
+async function readBestDocumentText(page) {
+  let best = '';
+  let bestFrameUrl = '';
+  const frames = allFrames(page);
+
+  for (const f of frames) {
     try {
-      if (await loc.count() && await loc.isVisible({ timeout: 1000 }).catch(() => false)) {
-        await loc.click({ timeout: 5000 }); clicked = true; break;
+      const txt = await f.locator('body').innerText({ timeout: 2500 });
+      const cleaned = cleanText(txt);
+      const n = normalize(cleaned);
+      // Ignora menu/árvore do SEI quando há outro frame com texto maior.
+      const penalty = n.includes('controle de processos') || n.includes('menu principal') || n.includes('arvore') ? 3000 : 0;
+      const score = Math.max(0, cleaned.length - penalty);
+      const bestScore = Math.max(0, best.length - (normalize(best).includes('controle de processos') ? 3000 : 0));
+      if (score > bestScore) {
+        best = cleaned;
+        bestFrameUrl = f.url();
       }
     } catch {}
   }
-  if (!clicked) return { texto: '', erroLeitura: 'Não foi possível clicar no documento.' };
 
-  await page.waitForTimeout(3000);
-  // O documento costuma abrir no painel/iframe direito. Pegamos o frame com mais texto útil.
-  let best = '';
-  for (const f of allFrames(page)) {
+  if (!best) best = cleanText(await page.locator('body').innerText({ timeout: 5000 }).catch(() => ''));
+  return { text: best, frameUrl: bestFrameUrl };
+}
+
+function validateReadText(text = '', candidate = {}) {
+  const parsed = parseDocumentName(candidate.text || '');
+  const id = parsed.id_sei || '';
+  const docName = parsed.documento || candidate.text || '';
+  const tipo = inferDocumentType(docName);
+  const clean = cleanText(text);
+  const n = normalize(clean);
+
+  const hasMinText = clean.length >= 120;
+  const hasId = id ? n.includes(normalize(id)) : false;
+  const hasTipo = tipo ? n.includes(normalize(tipo)) : false;
+  const hasDocName = docName ? n.includes(normalize(docName).slice(0, 30)) : false;
+  const hasUsefulSEIText = /(assunto|refer[êe]ncia|interessad|senhor|despacho|informa[cç][aã]o|of[ií]cio|documento|processo)/i.test(clean);
+
+  // Não exige todos os critérios, porque alguns documentos SEI não repetem o ID no corpo.
+  const confirmed = hasMinText && (hasId || hasTipo || hasDocName || hasUsefulSEIText);
+  const reason = confirmed ? null : `Leitura não confirmada. minText=${hasMinText}, id=${hasId}, tipo=${hasTipo}, nome=${hasDocName}, textoUtil=${hasUsefulSEIText}`;
+  return { confirmed, reason, hasMinText, hasId, hasTipo, hasDocName, hasUsefulSEIText };
+}
+
+async function tryLocatorClick(page, candidate, loc, name) {
+  if (!await loc.count().catch(() => 0)) return { ok: false, name, reason: 'locator não encontrado' };
+  const target = loc.first();
+  const visible = await target.isVisible({ timeout: 1200 }).catch(() => false);
+  if (!visible) return { ok: false, name, reason: 'locator não visível' };
+
+  const popupPromise = page.waitForEvent('popup', { timeout: 2500 }).catch(() => null);
+  try {
+    await target.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+    await target.click({ timeout: 5000, force: true });
+  } catch (err) {
+    // 2ª tentativa: duplo clique.
+    try { await target.dblclick({ timeout: 5000, force: true }); }
+    catch (err2) {
+      // 3ª tentativa: JS click no elemento/pai clicável.
+      try {
+        await target.evaluate((el) => {
+          const clickable = el.closest('a, span, div, td, li') || el;
+          clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+          clickable.dispatchEvent(new MouseEvent('dblclick', { bubbles: true, cancelable: true, view: window }));
+        });
+      } catch (err3) {
+        return { ok: false, name, reason: err3.message || err2.message || err.message };
+      }
+    }
+  }
+
+  const popup = await popupPromise;
+  if (popup) {
+    await popup.waitForLoadState('domcontentloaded', { timeout: SEI_TIMEOUT_MS }).catch(() => {});
+    await popup.waitForTimeout(1800);
+    const readPopup = await readBestDocumentText(popup);
+    const validPopup = validateReadText(readPopup.text, candidate);
+    if (validPopup.confirmed) {
+      await popup.close().catch(() => {});
+      return { ok: true, name: `${name}/popup`, texto: readPopup.text, validation: validPopup };
+    }
+    await popup.close().catch(() => {});
+  }
+
+  await page.waitForLoadState('domcontentloaded', { timeout: 7000 }).catch(() => {});
+  await page.waitForTimeout(2200);
+  const read = await readBestDocumentText(page);
+  const valid = validateReadText(read.text, candidate);
+  if (valid.confirmed) return { ok: true, name, texto: read.text, validation: valid };
+  return { ok: false, name, reason: valid.reason, textoTentativa: read.text?.slice(0, 1000) || '' };
+}
+
+async function clickByDirectHref(page, candidate) {
+  const label = cleanText(candidate.text || '');
+  const parsed = parseDocumentName(label);
+  const id = parsed.id_sei || '';
+  const docName = parsed.documento || label;
+
+  for (const frame of allFrames(page)) {
     try {
-      const txt = await f.locator('body').innerText({ timeout: 2000 });
-      const cleaned = cleanText(txt);
-      if (cleaned.length > best.length && !normalize(cleaned).includes('controle de processos')) best = cleaned;
+      const hrefs = await frame.locator('a').evaluateAll((els, args) => {
+        const { label, id, docName } = args;
+        return els.map(a => ({ text: (a.innerText || a.textContent || '').trim(), href: a.href || a.getAttribute('href') || '' }))
+          .filter(x => x.href && (
+            (label && x.text.includes(label)) ||
+            (id && (x.text.includes(id) || x.href.includes(id))) ||
+            (docName && x.text.includes(docName))
+          ));
+      }, { label, id, docName });
+
+      for (const h of hrefs.slice(0, 5)) {
+        try {
+          const url = new URL(h.href, frame.url()).toString();
+          const newPage = await page.context().newPage();
+          await newPage.goto(url, { waitUntil: 'domcontentloaded', timeout: SEI_TIMEOUT_MS });
+          await newPage.waitForTimeout(1800);
+          const read = await readBestDocumentText(newPage);
+          const valid = validateReadText(read.text, candidate);
+          await newPage.close().catch(() => {});
+          if (valid.confirmed) return { ok: true, name: 'href-direto', texto: read.text, validation: valid };
+        } catch {}
+      }
     } catch {}
   }
-  if (!best) best = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
-  return { texto: String(best || '').slice(0, 30000), erroLeitura: best ? null : 'Documento aberto, mas texto não foi encontrado.' };
+  return { ok: false, name: 'href-direto', reason: 'nenhum href válido confirmou a leitura' };
+}
+
+async function clickDocumentAndRead(page, candidate) {
+  const label = candidate.text;
+  const frame = candidate.frame;
+  const attempts = [];
+  console.log(`[SEI] Abrindo documento com leitura robusta: ${label}`);
+
+  // Estratégia A: vários locators e formas de clique.
+  for (const { loc, name } of locatorCandidatesForDocument(frame, candidate)) {
+    const result = await tryLocatorClick(page, candidate, loc, name);
+    attempts.push({ name: result.name, ok: result.ok, reason: result.reason || null });
+    console.log(`[SEI] Tentativa clique ${result.name}: ${result.ok ? 'OK' : 'falhou'}${result.reason ? ' - ' + result.reason : ''}`);
+    if (result.ok) return { texto: String(result.texto || '').slice(0, 30000), erroLeitura: null, leitura_confirmada: true, estrategia_leitura: result.name, tentativas_leitura: attempts };
+  }
+
+  // Estratégia B: abrir href direto em nova página quando o SEI usa link escondido.
+  const hrefResult = await clickByDirectHref(page, candidate);
+  attempts.push({ name: hrefResult.name, ok: hrefResult.ok, reason: hrefResult.reason || null });
+  console.log(`[SEI] Tentativa ${hrefResult.name}: ${hrefResult.ok ? 'OK' : 'falhou'}${hrefResult.reason ? ' - ' + hrefResult.reason : ''}`);
+  if (hrefResult.ok) return { texto: String(hrefResult.texto || '').slice(0, 30000), erroLeitura: null, leitura_confirmada: true, estrategia_leitura: hrefResult.name, tentativas_leitura: attempts };
+
+  // Fallback seguro: nunca impede o alerta.
+  return {
+    texto: '',
+    erroLeitura: `Não foi possível abrir/confirmar a leitura do documento após ${attempts.length} tentativa(s).`,
+    leitura_confirmada: false,
+    estrategia_leitura: null,
+    tentativas_leitura: attempts
+  };
 }
 
 async function getMovementsFromSEIReal(item) {
@@ -453,6 +612,9 @@ async function getMovementsFromSEIReal(item) {
         texto_documento: texto,
         resumo: read.erroLeitura ? `Movimentação identificada, mas o conteúdo não pôde ser lido: ${read.erroLeitura}` : `Documento ${documento} identificado pelo robô SEI.`,
         erro_leitura: read.erroLeitura || null,
+        leitura_confirmada: !!read.leitura_confirmada,
+        estrategia_leitura: read.estrategia_leitura || null,
+        tentativas_leitura: read.tentativas_leitura ? JSON.stringify(read.tentativas_leitura).slice(0, 4000) : null,
         hash_movimentacao: hash
       });
     }
@@ -553,9 +715,23 @@ async function processItem(item) {
 
   for (const baseMov of movements) {
     const mov = await enrichMovementWithDocumentText(item, baseMov);
+    const diffDays = daysSince(mov.data_movimentacao);
     const recentForAlert = isRecentMovement(mov, ALERT_DOCUMENT_RECENCY_DAYS);
     const recentForDemand = isRecentMovement(mov, DEMAND_DOCUMENT_RECENCY_DAYS);
     const { erro_leitura, texto_documento, ...movToSave } = mov;
+
+    // Evita duplicar alerta/movimentação quando a mesma movimentação já foi salva antes.
+    const { data: existingMov, error: existingErr } = await supabase
+      .from('processo_movimentacoes')
+      .select('id')
+      .eq('hash_movimentacao', mov.hash_movimentacao)
+      .maybeSingle();
+    if (existingErr) throw existingErr;
+    if (existingMov?.id) {
+      console.log(`[SEI] Movimentação já registrada, ignorando duplicidade: ${mov.documento}`);
+      continue;
+    }
+
     const { error: movErr } = await supabase.from('processo_movimentacoes').insert({
       processo_monitorado_id: item.origem === 'avulso' ? item.id : null,
       contrato_id: item.contrato_id || null,
@@ -567,30 +743,30 @@ async function processItem(item) {
     if (!movErr) newMovements++;
     if (movErr) continue;
 
-    // Regra corrigida: movimentação nova deve gerar alerta mesmo quando o robô não consegue abrir/ler o documento.
-    // A leitura do documento apenas enriquece o alerta; ela não pode impedir o alerta.
+    // Regra segura: documento novo em processo monitorado gera alerta. A janela de data classifica o alerta,
+    // mas não deve impedir a notificação quando a movimentação é nova no sistema.
     const matches = ruleMatches(mov, item);
     const leituraFalhou = !!mov.erro_leitura;
-    if (!item.gerar_alerta || !recentForAlert) {
-      console.log(`[SEI] Movimento registrado sem alerta. gerar_alerta=${item.gerar_alerta} recentForAlert=${recentForAlert} documento=${mov.documento}`);
-      continue;
-    }
-    if (!matches && !leituraFalhou) {
-      console.log(`[SEI] Movimento registrado sem alerta por regra de setor/tipo. setor=${mov.setor} tipo=${mov.tipo_documento} documento=${mov.documento}`);
+    const dataIncerta = diffDays === null;
+    const alertaInformativo = !recentForAlert || dataIncerta || !matches;
+    if (!item.gerar_alerta) {
+      console.log(`[SEI] Movimento registrado sem alerta porque gerar_alerta=false. documento=${mov.documento}`);
       continue;
     }
 
     const source_hash = `alert:${mov.hash_movimentacao}`;
     const primeiraLeitura = !hadPrevious;
-    const podeGerarDemanda = !!item.gerar_demanda && !primeiraLeitura && recentForDemand;
+    const podeGerarDemanda = !!item.gerar_demanda && !primeiraLeitura && recentForDemand && matches;
+    const prefixoInformativo = alertaInformativo ? '[INFORMATIVO] ' : '';
+    const leituraStatus = mov.leitura_confirmada ? 'Leitura do documento confirmada pelo robô.' : 'Conteúdo não confirmado/lido automaticamente.';
     const alertaPayload = {
       processo_monitorado_id: item.origem === 'avulso' ? item.id : null,
       contrato_id: item.contrato_id || null,
       numero_processo: item.numero_processo,
-      titulo: mov.assunto_identificado ? `${mov.assunto_identificado} - ${item.numero_processo}` : `Novo documento no processo ${item.numero_processo}`,
+      titulo: mov.assunto_identificado ? `${prefixoInformativo}${mov.assunto_identificado} - ${item.numero_processo}` : `${prefixoInformativo}Novo documento no processo ${item.numero_processo}`,
       descricao: primeiraLeitura
-        ? `Primeira leitura do processo. O documento foi registrado como referência inicial. ${mov.resumo_documento || mov.resumo || ''}`
-        : (mov.resumo_documento || mov.resumo || `Documento ${mov.documento} identificado pelo robô SEI.`),
+        ? `Primeira leitura do processo. O documento foi registrado como referência inicial. ${leituraStatus} ${mov.resumo_documento || mov.resumo || ''}`
+        : `${leituraStatus} ${mov.resumo_documento || mov.resumo || `Documento ${mov.documento} identificado pelo robô SEI.`}`,
       assunto_identificado: mov.assunto_identificado || null,
       resumo_documento: mov.resumo_documento || null,
       texto_documento: mov.texto_documento || null,
@@ -661,8 +837,8 @@ function checkTriggerToken(req, res) {
   return false;
 }
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.3.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: '11.3.0', mode: MODE, running, lastResult }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.4.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: '11.4.0', mode: MODE, running, lastResult }));
 
 async function handleManualRun(req, res) {
   if (!checkTriggerToken(req, res)) return;
@@ -679,7 +855,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.3.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.4.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }
