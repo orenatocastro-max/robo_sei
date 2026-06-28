@@ -217,15 +217,85 @@ async function fetchMonitoredItems() {
 }
 
 async function fillFirstVisible(pageOrFrame, selectors, value) {
-  for (const sel of selectors) {
+  const contexts = typeof pageOrFrame.frames === 'function' ? [pageOrFrame, ...pageOrFrame.frames()] : [pageOrFrame];
+
+  // 1) Seletores normais em página principal e frames.
+  for (const ctx of contexts) {
+    for (const sel of selectors) {
+      try {
+        const loc = ctx.locator(sel).first();
+        if (await loc.count() && await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await loc.fill(String(value));
+          return `selector:${sel}`;
+        }
+      } catch {}
+    }
+  }
+
+  // 2) Fallback: localizar input visível por heurística no DOM/frame.
+  // Isso cobre telas do SEI em que o campo não expõe id/name previsível.
+  for (const ctx of contexts) {
     try {
-      const loc = pageOrFrame.locator(sel).first();
-      if (await loc.count() && await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await loc.fill(String(value));
-        return sel;
+      const handle = await ctx.evaluateHandle((wantedSelectors) => {
+        const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
+        const visible = (el) => {
+          const r = el.getBoundingClientRect();
+          const st = window.getComputedStyle(el);
+          return r.width > 30 && r.height > 15 && st.display !== 'none' && st.visibility !== 'hidden' && Number(st.opacity || 1) !== 0;
+        };
+        const inputs = Array.from(document.querySelectorAll('input, textarea'))
+          .filter(visible)
+          .filter(el => !['hidden','button','submit','checkbox','radio','file'].includes(String(el.type || '').toLowerCase()));
+
+        const joined = wantedSelectors.join(' ').toUpperCase();
+        const isPasswordWanted = joined.includes('SENHA') || joined.includes('PASSWORD') || joined.includes('PWD');
+        if (isPasswordWanted) {
+          return inputs.find(el => String(el.type || '').toLowerCase() === 'password') || inputs[1] || null;
+        }
+
+        // Usuário/CPF costuma ser o primeiro input de texto visível antes da senha.
+        const scored = inputs.map((el, idx) => {
+          const r = el.getBoundingClientRect();
+          const label = norm([el.id, el.name, el.placeholder, el.title, el.autocomplete, el.getAttribute('aria-label'), el.className].filter(Boolean).join(' '));
+          let score = 0;
+          if (label.includes('USUARIO') || label.includes('LOGIN') || label.includes('CPF') || label.includes('MATRICULA')) score += 50;
+          if (['text','tel','number','email',''].includes(String(el.type || '').toLowerCase())) score += 10;
+          score += Math.max(0, 10 - idx);
+          score -= r.y / 10000;
+          return { el, score };
+        }).sort((a,b) => b.score - a.score);
+        return scored[0]?.el || inputs[0] || null;
+      }, selectors);
+      const element = handle.asElement();
+      if (element) {
+        await element.fill(String(value)).catch(async () => {
+          await element.click({ force: true });
+          await element.evaluate((el, val) => {
+            el.value = val;
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+          }, String(value));
+        });
+        return 'fallback-visible-input-heuristic';
       }
     } catch {}
   }
+
+  // 3) Diagnóstico sem imprimir valores digitados.
+  try {
+    const page = typeof pageOrFrame.frames === 'function' ? pageOrFrame : null;
+    if (page) {
+      for (const [i, frame] of page.frames().entries()) {
+        const diag = await frame.evaluate(() => Array.from(document.querySelectorAll('input, textarea, select, button'))
+          .map((el) => {
+            const r = el.getBoundingClientRect();
+            return `${el.tagName} id=${el.id||''} name=${el.name||''} type=${el.type||''} placeholder=${el.placeholder||''} title=${el.title||''} text=${(el.innerText||el.textContent||'').trim()} x=${Math.round(r.x)} y=${Math.round(r.y)} w=${Math.round(r.width)} h=${Math.round(r.height)}`;
+          }).slice(0, 50).join('\n')).catch(() => '');
+        if (diag) console.log(`[SEI][DEBUG CAMPOS FRAME ${i}]\n${diag}`);
+      }
+    }
+  } catch {}
+
   throw new Error(`Não localizei campo para preencher. Seletores testados: ${selectors.join(', ')}`);
 }
 
@@ -446,11 +516,11 @@ async function loginSEI(page) {
 
   await fillFirstVisible(page, [
     'input[name="txtUsuario"]', '#txtUsuario', 'input[id*=Usuario]', 'input[name*=Usuario]',
-    'input[type="text"]', 'input:not([type])'
+    'input[type="text"]', 'input[type="tel"]', 'input[type="number"]', 'input[type="email"]', 'input[autocomplete*=username]', 'input[placeholder*=Usu]', 'input[placeholder*=CPF]', 'input[placeholder*=Login]', 'input:not([type])'
   ], process.env.SEI_USER);
 
   await fillFirstVisible(page, [
-    'input[name="pwdSenha"]', '#pwdSenha', 'input[id*=Senha]', 'input[name*=Senha]', 'input[type="password"]'
+    'input[name="pwdSenha"]', '#pwdSenha', 'input[id*=Senha]', 'input[name*=Senha]', 'input[type="password"]', 'input[autocomplete*=password]', 'input[placeholder*=Senha]'
   ], process.env.SEI_PASSWORD);
 
   await selectUnidade(page, process.env.SEI_UNIDADE || '');
@@ -1025,7 +1095,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.7.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.8.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }
