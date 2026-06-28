@@ -25,6 +25,7 @@ const SEI_MAX_DOCUMENTS = Number(process.env.SEI_MAX_DOCUMENTS || 40);
 const SEI_READ_LAST_DOCUMENTS = Number(process.env.SEI_READ_LAST_DOCUMENTS || 1);
 const SEI_HEADLESS = String(process.env.SEI_HEADLESS || 'true').toLowerCase() !== 'false';
 const SEI_DEBUG = String(process.env.SEI_DEBUG || 'false').toLowerCase() === 'true';
+const VERSION = '12.0.0';
 let running = false;
 let lastResult = null;
 
@@ -57,9 +58,14 @@ function looksLikeProcessTreeText(text = '') {
   return hasTreeTerms || romanSeq || (manyDocNames && manyIds && lacksDocumentHeader);
 }
 
-function safeFallbackSubject(movement = {}) {
+function formatDocumentRef(movement = {}) {
   const tipo = movement.tipo_documento || 'Documento';
-  return `Novo ${tipo} inserido no processo`;
+  const id = movement.id_sei || (String(movement.documento || '').match(/\((\d{5,})\)/) || [])[1] || '';
+  return `${tipo}${id ? ` (${id})` : ''}`;
+}
+
+function safeFallbackSubject(movement = {}) {
+  return `Novo ${formatDocumentRef(movement)} inserido no processo`;
 }
 
 function safeFallbackSummary(movement = {}) {
@@ -124,11 +130,44 @@ function parseDocumentName(text = '') {
 }
 
 function inferDocumentType(name = '') {
-  const n = normalize(name);
-  const known = ['Despacho', 'Informação', 'Ofício', 'Memorando', 'Parecer', 'Anexo', 'Termo Aditivo', 'Nota Técnica', 'Contrato', 'Termo de Referência', 'Portaria'];
-  for (const k of known) if (n.includes(normalize(k))) return k;
-  const first = cleanText(name).split(' ')[0] || 'Documento';
-  return first;
+  const clean = cleanText(name);
+  const n = normalize(clean);
+  // Evita classificar setor/unidade como "Contrato" apenas porque aparece "Gerência de Contratos".
+  if (/^SESAU-|GER[ÊE]NCIA|N[ÚU]CLEO|COORDENADORIA|UNIDADE/i.test(clean) && !/\(\d{5,}\)/.test(clean)) return 'Documento';
+
+  const patterns = [
+    ['Termo Aditivo', /^Termo\s+Aditivo\b/i],
+    ['Nota Técnica', /^Nota\s+T[ée]cnica\b/i],
+    ['Termo de Referência', /^Termo\s+de\s+Refer[êe]ncia\b/i],
+    ['Informação', /^Informa[cç][aã]o\b/i],
+    ['Despacho', /^Despacho\b/i],
+    ['Ofício', /^Of[íi]cio\b/i],
+    ['Memorando', /^Memorando\b/i],
+    ['Parecer', /^Parecer\b/i],
+    ['Anexo', /^Anexo\b/i],
+    ['Portaria', /^Portaria\b/i],
+    ['Certidão', /^Certid[ãa]o\b/i],
+    ['Consulta', /^Consulta\b/i],
+    ['Comunicação', /^Comunica[cç][aã]o\b/i],
+    ['Contrato', /^Contrato\b/i]
+  ];
+  for (const [label, pattern] of patterns) if (pattern.test(clean)) return label;
+
+  // Anexo Contrato (id) continua sendo Anexo, não Contrato.
+  const first = clean.split(/\s+/)[0] || 'Documento';
+  return first.length > 30 ? 'Documento' : first;
+}
+
+function isValidDocumentLabel(text = '') {
+  const t = cleanText(text);
+  if (!t || t.length > 180) return false;
+  // Documento SEI normalmente tem tipo documental + ID entre parênteses.
+  const hasId = /\(\d{5,}\)/.test(t);
+  const startsDocType = /^(Informação|Informacao|Despacho|Ofício|Oficio|Memorando|Parecer|Anexo|Contrato|Termo\s+Aditivo|Termo\s+de\s+Referência|Termo\s+de\s+Referencia|Nota\s+Técnica|Nota\s+Tecnica|Portaria|Certidão|Certidao|Consulta|Comunicação|Comunicacao)\b/i.test(t);
+  if (!hasId || !startsDocType) return false;
+  // Evita unidade/setor como “SESAU-GECONT - GERÊNCIA DE CONTRATOS”.
+  if (/^SESAU-|GER[ÊE]NCIA|N[ÚU]CLEO|COORDENADORIA|CONTROLE DE PROCESSOS/i.test(t)) return false;
+  return true;
 }
 
 function parseBRDate(value) {
@@ -608,7 +647,6 @@ async function searchProcess(page, numeroProcesso) {
 }
 
 async function collectDocumentCandidates(page) {
-  const keywords = /(Informação|Informacao|Despacho|Ofício|Oficio|Memorando|Parecer|Anexo|Contrato|Termo|Nota Técnica|Nota Tecnica|Portaria)/i;
   const candidates = [];
   for (const frame of allFrames(page)) {
     try {
@@ -618,16 +656,25 @@ async function collectDocumentCandidates(page) {
           const r = el.getBoundingClientRect();
           return s && s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
         };
-        return els.map((el, idx) => ({ idx, text: (el.innerText || el.textContent || '').trim() }))
-          .filter(x => x.text && x.text.length < 220)
-          .filter((x, i, arr) => arr.findIndex(y => y.text === x.text) === i)
-          .filter(x => /Informação|Informacao|Despacho|Ofício|Oficio|Memorando|Parecer|Anexo|Contrato|Termo|Nota Técnica|Nota Tecnica|Portaria/i.test(x.text));
+        const valid = (text) => {
+          const t = String(text || '').replace(/\s+/g, ' ').trim();
+          if (!t || t.length > 180) return false;
+          const hasId = /\(\d{5,}\)/.test(t);
+          const startsDocType = /^(Informação|Informacao|Despacho|Ofício|Oficio|Memorando|Parecer|Anexo|Contrato|Termo\s+Aditivo|Termo\s+de\s+Referência|Termo\s+de\s+Referencia|Nota\s+Técnica|Nota\s+Tecnica|Portaria|Certidão|Certidao|Consulta|Comunicação|Comunicacao)\b/i.test(t);
+          if (!hasId || !startsDocType) return false;
+          if (/^SESAU-|GER[ÊE]NCIA|N[ÚU]CLEO|COORDENADORIA|CONTROLE DE PROCESSOS/i.test(t)) return false;
+          return true;
+        };
+        return els
+          .filter(isVisible)
+          .map((el, idx) => ({ idx, text: (el.innerText || el.textContent || '').trim(), tag: el.tagName, href: el.href || el.getAttribute('href') || '' }))
+          .filter(x => valid(x.text))
+          .filter((x, i, arr) => arr.findIndex(y => y.text === x.text) === i);
       });
-      for (const f of found) candidates.push({ frame, text: f.text });
+      for (const f of found) candidates.push({ frame, text: cleanText(f.text), href: f.href || '' });
     } catch {}
   }
 
-  // Ordena na ordem encontrada, remove duplicados exatos e limita aos últimos documentos.
   const unique = [];
   const seen = new Set();
   for (const c of candidates) {
@@ -854,6 +901,10 @@ async function getMovementsFromSEIReal(item) {
     const selected = candidates.slice(-Math.max(1, SEI_READ_LAST_DOCUMENTS));
     const movements = [];
     for (const cand of selected) {
+      if (!isValidDocumentLabel(cand.text)) {
+        console.log(`[SEI] Ignorando candidato que não parece documento válido: ${cand.text}`);
+        continue;
+      }
       const { documento, id_sei } = parseDocumentName(cand.text);
       const tipo_documento = inferDocumentType(documento);
       const read = await clickDocumentAndRead(page, cand);
@@ -1024,7 +1075,7 @@ async function processItem(item) {
       processo_monitorado_id: item.origem === 'avulso' ? item.id : null,
       contrato_id: item.contrato_id || null,
       numero_processo: item.numero_processo,
-      titulo: mov.assunto_identificado ? `${prefixoInformativo}${mov.assunto_identificado} - ${item.numero_processo}` : `${prefixoInformativo}Novo documento no processo ${item.numero_processo}`,
+      titulo: `${prefixoInformativo}${formatDocumentRef(mov)} inserido no processo ${item.numero_processo}`, 
       descricao: primeiraLeitura
         ? `Primeira leitura do processo. Documento registrado como referência inicial. ${leituraStatus}`
         : `${leituraStatus} ${mov.resumo_documento || `Documento ${mov.documento} identificado pelo robô SEI.`}`,
@@ -1039,6 +1090,7 @@ async function processItem(item) {
       setor: mov.setor,
       tipo_documento: mov.tipo_documento,
       documento: mov.documento,
+      id_sei: mov.id_sei || null,
       data_movimentacao: mov.data_movimentacao,
       source_hash,
       status: 'Pendente',
@@ -1121,7 +1173,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.9.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão ${VERSION}`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }

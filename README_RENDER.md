@@ -14,3 +14,11 @@ npx playwright install chromium && node index.js
 ```
 
 Mantenha `ROBOT_MODE=sei` para SEI real.
+
+## v12.0.0
+
+Correções:
+- Filtra candidatos para considerar apenas documentos SEI com padrão `Tipo ... (ID)`.
+- Evita classificar `SESAU-GECONT - GERÊNCIA DE CONTRATOS` como documento do tipo Contrato.
+- Alerta passa a sair com título no padrão: `Tipo do documento (ID) inserido no processo ...`.
+- Continua salvando assunto/resumo quando a leitura for confiável.

@@ -1,6 +1,6 @@
 {
   "name": "robo-sei-niar",
-  "version": "11.9.0",
+  "version": "12.0.0",
   "type": "module",
   "scripts": {
     "start": "node index.js",
