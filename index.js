@@ -119,8 +119,20 @@ function inferDocumentType(name = '') {
 function parseBRDate(value) {
   if (!value) return null;
   const s = String(value).trim();
-  const m = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]), 12, 0, 0);
+
+  // Aceita: 27/06/2026, 27/06/2026 10:30, 27/06/2026, 10:30:22
+  const br = s.match(/(\d{2})\/(\d{2})\/(\d{4})(?:[,\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+  if (br) {
+    return new Date(
+      Number(br[3]),
+      Number(br[2]) - 1,
+      Number(br[1]),
+      Number(br[4] || 12),
+      Number(br[5] || 0),
+      Number(br[6] || 0)
+    );
+  }
+
   const iso = new Date(s);
   return Number.isNaN(iso.getTime()) ? null : iso;
 }
@@ -156,12 +168,28 @@ async function hasPreviousMovements(item) {
   return (data || []).length > 0;
 }
 
+function splitRuleList(value = '') {
+  return String(value || '')
+    .split(/[,;|\n]+/)
+    .map(v => normalize(v).trim())
+    .filter(Boolean);
+}
+
+function anyRuleMatches(value, rules) {
+  if (!rules.length) return true;
+  const v = normalize(value || '');
+  return rules.some(r => v.includes(r) || r.includes(v));
+}
+
 function ruleMatches(mov, rule) {
-  const setor = normalize(rule.setor_interesse || rule.setor_alerta || '');
-  const tipo = normalize(rule.tipo_documento_interesse || rule.tipo_documento_alerta || '');
-  if (setor && !normalize(mov.setor).includes(setor)) return false;
-  if (tipo && !normalize(mov.tipo_documento).includes(tipo) && !normalize(mov.documento).includes(tipo)) return false;
-  return true;
+  const setores = splitRuleList(rule.setor_interesse || rule.setor_alerta || '');
+  const tipos = splitRuleList(rule.tipo_documento_interesse || rule.tipo_documento_alerta || '');
+
+  const setorOk = anyRuleMatches(mov.setor, setores);
+  const tipoBase = `${mov.tipo_documento || ''} ${mov.documento || ''}`;
+  const tipoOk = anyRuleMatches(tipoBase, tipos);
+
+  return setorOk && tipoOk;
 }
 
 async function fetchMonitoredItems() {
@@ -424,6 +452,7 @@ async function getMovementsFromSEIReal(item) {
         id_sei,
         texto_documento: texto,
         resumo: read.erroLeitura ? `Movimentação identificada, mas o conteúdo não pôde ser lido: ${read.erroLeitura}` : `Documento ${documento} identificado pelo robô SEI.`,
+        erro_leitura: read.erroLeitura || null,
         hash_movimentacao: hash
       });
     }
@@ -462,12 +491,15 @@ async function enrichMovementWithDocumentText(item, movement) {
   const texto = await readDocumentContent(item, movement);
   const assunto = extractDocumentSubject(texto, movement);
   const resumoDoc = summarizeDocumentText(texto, movement);
+  const fallbackResumo = movement.erro_leitura
+    ? `Movimentação nova identificada, mas o conteúdo do documento não pôde ser lido automaticamente. Motivo: ${movement.erro_leitura}`
+    : movement.resumo;
   return {
     ...movement,
     texto_documento: texto ? String(texto).slice(0, 12000) : null,
-    assunto_identificado: assunto,
-    resumo_documento: resumoDoc,
-    resumo: resumoDoc || movement.resumo
+    assunto_identificado: assunto || `Novo documento no processo`,
+    resumo_documento: resumoDoc || fallbackResumo,
+    resumo: resumoDoc || fallbackResumo
   };
 }
 
@@ -523,17 +555,30 @@ async function processItem(item) {
     const mov = await enrichMovementWithDocumentText(item, baseMov);
     const recentForAlert = isRecentMovement(mov, ALERT_DOCUMENT_RECENCY_DAYS);
     const recentForDemand = isRecentMovement(mov, DEMAND_DOCUMENT_RECENCY_DAYS);
+    const { erro_leitura, texto_documento, ...movToSave } = mov;
     const { error: movErr } = await supabase.from('processo_movimentacoes').insert({
       processo_monitorado_id: item.origem === 'avulso' ? item.id : null,
       contrato_id: item.contrato_id || null,
       numero_processo: item.numero_processo,
-      ...mov
+      ...movToSave,
+      texto_documento: texto_documento || null
     });
     if (movErr && !String(movErr.message).toLowerCase().includes('duplicate')) throw movErr;
     if (!movErr) newMovements++;
     if (movErr) continue;
 
-    if (!item.gerar_alerta || !ruleMatches(mov, item) || !recentForAlert) continue;
+    // Regra corrigida: movimentação nova deve gerar alerta mesmo quando o robô não consegue abrir/ler o documento.
+    // A leitura do documento apenas enriquece o alerta; ela não pode impedir o alerta.
+    const matches = ruleMatches(mov, item);
+    const leituraFalhou = !!mov.erro_leitura;
+    if (!item.gerar_alerta || !recentForAlert) {
+      console.log(`[SEI] Movimento registrado sem alerta. gerar_alerta=${item.gerar_alerta} recentForAlert=${recentForAlert} documento=${mov.documento}`);
+      continue;
+    }
+    if (!matches && !leituraFalhou) {
+      console.log(`[SEI] Movimento registrado sem alerta por regra de setor/tipo. setor=${mov.setor} tipo=${mov.tipo_documento} documento=${mov.documento}`);
+      continue;
+    }
 
     const source_hash = `alert:${mov.hash_movimentacao}`;
     const primeiraLeitura = !hadPrevious;
@@ -616,8 +661,8 @@ function checkTriggerToken(req, res) {
   return false;
 }
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.0.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: '11.0.0', mode: MODE, running, lastResult }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.3.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: '11.3.0', mode: MODE, running, lastResult }));
 
 async function handleManualRun(req, res) {
   if (!checkTriggerToken(req, res)) return;
@@ -634,7 +679,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.0.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.3.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }
