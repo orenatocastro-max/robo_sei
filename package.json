@@ -1,15 +1,18 @@
 {
   "name": "robo-sei-niar",
-  "version": "11.0.0",
+  "version": "11.1.0",
   "type": "module",
   "scripts": {
     "start": "node index.js",
     "once": "node index.js --once",
-    "postinstall": "npx playwright install chromium"
+    "install-browser": "npx playwright install chromium"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.87.1",
     "express": "^5.2.1",
     "playwright": "^1.57.0"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }

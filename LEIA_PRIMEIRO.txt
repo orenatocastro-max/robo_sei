@@ -1,9 +1,9 @@
-ROBÔ SEI NIAR v11
+ROBÔ SEI NIAR v11.1 - CORREÇÃO RENDER
 
-1. Substitua no GitHub do robô os arquivos antigos por estes arquivos.
-2. No Render, atualize as variáveis e coloque ROBOT_MODE=sei.
-3. Faça Manual Deploy > Clear build cache & deploy.
-4. Teste pelo link /trigger?token=...
-5. Veja os logs para confirmar se passou por: login, pesquisa do processo, documentos encontrados, documento aberto, alerta salvo.
+Substitua os arquivos no GitHub do robô.
+No Render, use:
+Build Command: npm install && npx playwright install chromium
+Start Command: npm start
+Root Directory: vazio
 
-A senha e a secret key ficam somente no Render. Não coloque no GitHub.
+Essa versão remove o postinstall do package.json e fixa Node 20.x para evitar o erro npm: Exit handler never called.
