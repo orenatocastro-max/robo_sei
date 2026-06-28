@@ -1,6 +1,6 @@
-Robô SEI NIAR v11.5
+Robô SEI NIAR v11.6
 
 Substitua no GitHub do robô os arquivos desta pasta.
-Depois, no Render, execute: Manual Deploy > Clear build cache & deploy.
+Depois, no Render, rode Manual Deploy > Clear build cache & deploy.
 
-Você não precisa rodar agora se ainda vai vincular novos contratos/processos. Esta versão fica pronta para os testes robustos.
+Esta versão corrige o clique no botão ACESSAR usando métodos adicionais, inclusive clique por coordenada aproximada.

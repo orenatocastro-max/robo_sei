@@ -250,57 +250,135 @@ async function clickLoginAcessar(page) {
     'input[type="submit"][value*="ACESS"]',
     'button:has-text("ACESSAR")',
     'button:has-text("Acessar")',
+    'a:has-text("ACESSAR")',
+    'a:has-text("Acessar")',
+    '[role="button"]:has-text("ACESSAR")',
+    '[role="button"]:has-text("Acessar")',
     '#btnAcessar', '#btnLogin', '#sbmLogin', '#btnEnviar', '#btnEntrar',
     'input[name*=Acess]', 'input[id*=Acess]',
     'input[name*=Login]', 'input[id*=Login]',
     'input[type="submit"]', 'button[type="submit"]',
-    'text=ACESSAR', 'text=Acessar'
+    'text=ACESSAR', 'text=Acessar',
+    'xpath=//*[contains(translate(normalize-space(.), "acessar", "ACESSAR"), "ACESSAR")]'
   ];
 
-  try {
-    return await clickFirstVisible(page, selectors);
-  } catch (err) {
-    console.log('[SEI] Clique normal no botão ACESSAR não funcionou. Tentando fallback por JavaScript/Enter...');
+  // 1) tenta seletores normais na página principal e em todos os frames.
+  for (const ctx of [page, ...page.frames()]) {
+    try {
+      const method = await clickFirstVisible(ctx, selectors);
+      await page.waitForTimeout(1200);
+      return `selector:${method}`;
+    } catch {}
   }
 
-  // Fallback 1: procurar qualquer input/button/anchor cujo texto, value, id ou name contenha ACESS/LOGIN/ENTRAR.
-  const clicked = await page.evaluate(() => {
-    const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase();
-    const els = Array.from(document.querySelectorAll('input, button, a'));
-    const target = els.find((el) => {
-      const txt = norm(el.innerText || el.textContent || el.value || el.id || el.name || el.title || el.getAttribute('aria-label'));
-      return txt.includes('ACESS') || txt.includes('LOGIN') || txt.includes('ENTRAR');
-    });
-    if (target) {
-      target.click();
-      return true;
-    }
-    return false;
-  }).catch(() => false);
-  if (clicked) return 'fallback-js-click-login';
+  console.log('[SEI] Clique normal no botão ACESSAR não funcionou. Tentando fallbacks robustos...');
 
-  // Fallback 2: submeter o primeiro formulário da página.
-  const submitted = await page.evaluate(() => {
-    const forms = Array.from(document.forms || []);
-    if (forms.length) {
-      if (typeof forms[0].requestSubmit === 'function') forms[0].requestSubmit();
-      else forms[0].submit();
-      return true;
+  // 2) tenta clicar em qualquer elemento visível que tenha texto/value/id/name parecido.
+  for (const frame of page.frames()) {
+    const clicked = await frame.evaluate(() => {
+      const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
+      const isVisible = (el) => {
+        const r = el.getBoundingClientRect();
+        const st = window.getComputedStyle(el);
+        return r.width > 5 && r.height > 5 && st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity || 1) !== 0;
+      };
+      const els = Array.from(document.querySelectorAll('input, button, a, div, span, label'));
+      const target = els.find((el) => {
+        if (!isVisible(el)) return false;
+        const txt = norm([el.innerText, el.textContent, el.value, el.id, el.name, el.title, el.getAttribute('aria-label')].filter(Boolean).join(' '));
+        return txt.includes('ACESSAR') || txt.includes('ACESS') || txt.includes('LOGIN') || txt.includes('ENTRAR');
+      });
+      if (target) {
+        const clickable = target.closest('button,input,a,[onclick]') || target;
+        clickable.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
+        clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+        clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+        clickable.click();
+        return true;
+      }
+      return false;
+    }).catch(() => false);
+    if (clicked) {
+      await page.waitForTimeout(1800);
+      return 'fallback-dom-visible-text-click';
     }
-    return false;
-  }).catch(() => false);
-  if (submitted) return 'fallback-form-submit';
+  }
 
-  // Fallback 3: Enter no campo de senha.
+  // 3) tenta submeter formulários e chamar funções comuns de login, se existirem.
+  for (const frame of page.frames()) {
+    const submitted = await frame.evaluate(() => {
+      const candidates = ['login', 'logar', 'entrar', 'acessar', 'validarLogin', 'onSubmit', 'submitLogin'];
+      for (const name of candidates) {
+        try { if (typeof window[name] === 'function') { window[name](); return `function:${name}`; } } catch {}
+      }
+      const forms = Array.from(document.forms || []);
+      for (const form of forms) {
+        try {
+          if (typeof form.requestSubmit === 'function') form.requestSubmit();
+          else form.submit();
+          return 'form-submit';
+        } catch {}
+      }
+      return '';
+    }).catch(() => '');
+    if (submitted) {
+      await page.waitForTimeout(1800);
+      return `fallback-${submitted}`;
+    }
+  }
+
+  // 4) tentativa por teclado: senha -> Tab -> Enter, e unidade -> Tab -> Enter.
   try {
     const pwd = page.locator('input[type="password"]').first();
     if (await pwd.count()) {
+      await pwd.focus();
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(1800);
+      return 'fallback-keyboard-tab-enter';
+    }
+  } catch {}
+
+  // 5) tentativa por coordenada: clica abaixo do último campo visível do formulário.
+  try {
+    const boxes = await page.evaluate(() => {
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        const st = getComputedStyle(el);
+        return r.width > 20 && r.height > 15 && st.display !== 'none' && st.visibility !== 'hidden';
+      };
+      return Array.from(document.querySelectorAll('input, select'))
+        .filter(visible)
+        .map((el) => {
+          const r = el.getBoundingClientRect();
+          return { x: r.x, y: r.y, width: r.width, height: r.height };
+        })
+        .sort((a,b) => a.y - b.y);
+    });
+    if (boxes && boxes.length) {
+      const last = boxes[boxes.length - 1];
+      const x = last.x + last.width / 2;
+      const y = last.y + last.height + 45;
+      console.log(`[SEI] Tentando clique por coordenada aproximada em x=${Math.round(x)}, y=${Math.round(y)}...`);
+      await page.mouse.click(x, y);
+      await page.waitForTimeout(1800);
+      return 'fallback-coordinate-click';
+    }
+  } catch {}
+
+  // 6) último recurso: Enter direto no campo senha novamente.
+  try {
+    const pwd = page.locator('input[type="password"]').first();
+    if (await pwd.count()) {
+      await pwd.focus();
       await pwd.press('Enter');
+      await page.waitForTimeout(1800);
       return 'fallback-password-enter';
     }
   } catch {}
 
-  throw new Error(`Não localizei/acionou botão ACESSAR. Seletores e fallbacks testados: ${selectors.join(', ')}, fallback-js-click-login, fallback-form-submit, fallback-password-enter`);
+  throw new Error(`Não localizei/acionou botão ACESSAR. Seletores e fallbacks testados: ${selectors.join(', ')}, dom-visible-text-click, js-function/form-submit, keyboard-tab-enter, coordinate-click, password-enter`);
 }
 
 async function selectUnidade(page, unidade) {
@@ -914,7 +992,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.5.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.6.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }
