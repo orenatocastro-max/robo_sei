@@ -1,3 +1,4 @@
+
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
 
@@ -17,6 +18,11 @@ const MODE = process.env.ROBOT_MODE || 'simulation';
 const INTERVAL_MINUTES = Number(process.env.RUN_INTERVAL_MINUTES || process.env.CHECK_INTERVAL_MINUTES || 60);
 const DEMAND_DOCUMENT_RECENCY_DAYS = Number(process.env.DEMAND_DOCUMENT_RECENCY_DAYS || 3);
 const ALERT_DOCUMENT_RECENCY_DAYS = Number(process.env.ALERT_DOCUMENT_RECENCY_DAYS || 7);
+const SEI_TIMEOUT_MS = Number(process.env.SEI_TIMEOUT_MS || 45000);
+const SEI_MAX_DOCUMENTS = Number(process.env.SEI_MAX_DOCUMENTS || 40);
+const SEI_READ_LAST_DOCUMENTS = Number(process.env.SEI_READ_LAST_DOCUMENTS || 1);
+const SEI_HEADLESS = String(process.env.SEI_HEADLESS || 'true').toLowerCase() !== 'false';
+const SEI_DEBUG = String(process.env.SEI_DEBUG || 'false').toLowerCase() === 'true';
 let running = false;
 let lastResult = null;
 
@@ -33,10 +39,7 @@ function firstNonEmptyLine(text = '') {
 }
 
 function cleanText(text = '') {
-  return String(text)
-    .replace(/\s+/g, ' ')
-    .replace(/ /g, ' ')
-    .trim();
+  return String(text).replace(/\s+/g, ' ').replace(/ /g, ' ').trim();
 }
 
 function extractDocumentSubject(text = '', movement = {}) {
@@ -52,7 +55,7 @@ function extractDocumentSubject(text = '', movement = {}) {
   ];
   for (const pattern of explicitPatterns) {
     const match = raw.match(pattern);
-    if (match?.[1]) return cleanText(match[1]).slice(0, 180);
+    if (match?.[1]) return cleanText(match[1]).slice(0, 220);
   }
 
   const themes = [
@@ -71,45 +74,44 @@ function extractDocumentSubject(text = '', movement = {}) {
     ['nota tecnica', 'Nota técnica / análise técnica'],
     ['pagamento', 'Pagamento / faturamento'],
     ['fiscalizacao', 'Fiscalização contratual'],
-    ['notificacao', 'Notificação ou comunicação formal']
+    ['notificacao', 'Notificação ou comunicação formal'],
+    ['oficio', 'Ofício / comunicação externa'],
+    ['informacao', 'Informação técnica / resposta administrativa']
   ];
-  for (const [key, label] of themes) {
-    if (normalized.includes(key)) return label;
-  }
+  for (const [key, label] of themes) if (normalized.includes(key)) return label;
 
   const line = firstNonEmptyLine(raw);
-  if (line) return cleanText(line).slice(0, 180);
+  if (line) return cleanText(line).slice(0, 220);
   return `Novo ${tipo} identificado no processo`;
 }
 
 function summarizeDocumentText(text = '', movement = {}) {
   const raw = cleanText(text);
   if (!raw) return movement.resumo || `Novo documento/movimentação identificado pelo robô SEI: ${movement.documento || movement.tipo_documento || 'documento'}.`;
-  const sentences = raw.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [raw];
-  const summary = sentences.slice(0, 2).join(' ').trim();
-  return summary.slice(0, 500);
+
+  const assuntoMatch = raw.match(/assunto\s*[:\-]\s*([^\n\.]+[\.]?)/i);
+  const interessadoMatch = raw.match(/(ao senhor|a senhora|interessad[oa]|empresa|contratada)\s*[:\-]?\s*([^\n\.]{10,180})/i);
+  const firstSentences = raw.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [raw];
+  const parts = [];
+  if (assuntoMatch?.[0]) parts.push(cleanText(assuntoMatch[0]));
+  if (interessadoMatch?.[0]) parts.push(cleanText(interessadoMatch[0]));
+  parts.push(...firstSentences.slice(0, 2).map(cleanText));
+  return [...new Set(parts)].join(' ').slice(0, 700);
 }
 
-async function readDocumentContent(_item, movement) {
-  // Em ROBOT_MODE=simulation, criamos um conteúdo de teste para validar o alerta personalizado.
-  // Em ROBOT_MODE=real, esta função deve ser ligada aos seletores do SEI após mapearmos a tela real do documento.
-  if (MODE === 'simulation') {
-    return `Assunto: Solicitação de manifestação sobre vigência contratual.\n\nDocumento simulado do setor ${movement.setor || 'GECONT'} referente ao processo. Trata de análise/encaminhamento relacionado ao contrato monitorado, com necessidade de verificação pela equipe gestora.`;
-  }
-  return movement.texto_documento || '';
+function parseDocumentName(text = '') {
+  const t = cleanText(text);
+  const m = t.match(/^(.+?)\s*\((\d+)\)/);
+  if (m) return { documento: cleanText(m[1]), id_sei: m[2] };
+  return { documento: t, id_sei: null };
 }
 
-async function enrichMovementWithDocumentText(item, movement) {
-  const texto = await readDocumentContent(item, movement);
-  const assunto = extractDocumentSubject(texto, movement);
-  const resumoDoc = summarizeDocumentText(texto, movement);
-  return {
-    ...movement,
-    texto_documento: texto ? String(texto).slice(0, 12000) : null,
-    assunto_identificado: assunto,
-    resumo_documento: resumoDoc,
-    resumo: resumoDoc || movement.resumo
-  };
+function inferDocumentType(name = '') {
+  const n = normalize(name);
+  const known = ['Despacho', 'Informação', 'Ofício', 'Memorando', 'Parecer', 'Anexo', 'Termo Aditivo', 'Nota Técnica', 'Contrato', 'Termo de Referência', 'Portaria'];
+  for (const k of known) if (n.includes(normalize(k))) return k;
+  const first = cleanText(name).split(' ')[0] || 'Documento';
+  return first;
 }
 
 function parseBRDate(value) {
@@ -161,47 +163,273 @@ function ruleMatches(mov, rule) {
 }
 
 async function fetchMonitoredItems() {
-  const { data: contratos, error: cErr } = await supabase
-    .from('contratos')
-    .select('*')
-    .eq('monitorar_sei', true);
+  const { data: contratos, error: cErr } = await supabase.from('contratos').select('*').eq('monitorar_sei', true);
   if (cErr) throw cErr;
 
-  const { data: avulsos, error: pErr } = await supabase
-    .from('processos_monitorados')
-    .select('*')
-    .eq('monitoramento_ativo', true);
+  const { data: avulsos, error: pErr } = await supabase.from('processos_monitorados').select('*').eq('monitoramento_ativo', true);
   if (pErr) throw pErr;
 
   return [
     ...(contratos || []).map(c => ({
-      origem: 'contrato',
-      id: c.id,
-      contrato_id: c.id,
-      numero_contrato: c.numero_contrato,
-      prestador: c.prestador,
-      numero_processo: c.processo,
-      assunto: `Contrato ${c.numero_contrato || 's/n'} - ${c.prestador || ''}`,
-      setor_alerta: c.setor_alerta,
-      tipo_documento_alerta: c.tipo_documento_alerta,
-      gerar_alerta: c.gerar_alerta_sei !== false,
-      gerar_demanda: c.gerar_demanda_sei !== false,
-      raw: c
+      origem: 'contrato', id: c.id, contrato_id: c.id,
+      numero_contrato: c.numero_contrato, prestador: c.prestador,
+      numero_processo: c.processo, assunto: `Contrato ${c.numero_contrato || 's/n'} - ${c.prestador || ''}`,
+      setor_alerta: c.setor_alerta, tipo_documento_alerta: c.tipo_documento_alerta,
+      gerar_alerta: c.gerar_alerta_sei !== false, gerar_demanda: c.gerar_demanda_sei !== false, raw: c
     })),
     ...(avulsos || []).map(p => ({
-      origem: 'avulso',
-      id: p.id,
-      processo_monitorado_id: p.id,
-      contrato_id: p.contrato_id || null,
-      numero_processo: p.numero_processo,
-      assunto: p.assunto,
-      setor_interesse: p.setor_interesse,
-      tipo_documento_interesse: p.tipo_documento_interesse,
-      gerar_alerta: p.gerar_alerta !== false,
-      gerar_demanda: p.gerar_demanda !== false,
-      raw: p
+      origem: 'avulso', id: p.id, processo_monitorado_id: p.id, contrato_id: p.contrato_id || null,
+      numero_processo: p.numero_processo, assunto: p.assunto,
+      setor_interesse: p.setor_interesse, tipo_documento_interesse: p.tipo_documento_interesse,
+      gerar_alerta: p.gerar_alerta !== false, gerar_demanda: p.gerar_demanda !== false, raw: p
     }))
   ].filter(x => x.numero_processo);
+}
+
+async function fillFirstVisible(pageOrFrame, selectors, value) {
+  for (const sel of selectors) {
+    try {
+      const loc = pageOrFrame.locator(sel).first();
+      if (await loc.count() && await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await loc.fill(String(value));
+        return sel;
+      }
+    } catch {}
+  }
+  throw new Error(`Não localizei campo para preencher. Seletores testados: ${selectors.join(', ')}`);
+}
+
+async function clickFirstVisible(pageOrFrame, selectors) {
+  for (const sel of selectors) {
+    try {
+      const loc = pageOrFrame.locator(sel).first();
+      if (await loc.count() && await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
+        await loc.click();
+        return sel;
+      }
+    } catch {}
+  }
+  throw new Error(`Não localizei botão/link. Seletores testados: ${selectors.join(', ')}`);
+}
+
+async function selectUnidade(page, unidade) {
+  if (!unidade) return;
+  const candidates = ['select', 'select[name*=Unidade]', '#selInfraUnidades', '#selOrgao', '[name*=Unidade]'];
+  for (const sel of candidates) {
+    try {
+      const loc = page.locator(sel).first();
+      if (await loc.count() && await loc.isVisible({ timeout: 2000 }).catch(() => false)) {
+        // Se for select, tenta por label e por value aproximado
+        try { await loc.selectOption({ label: unidade }); return; } catch {}
+        try { await loc.selectOption(unidade); return; } catch {}
+        try {
+          await loc.click();
+          await page.keyboard.press(process.platform === 'darwin' ? 'Meta+A' : 'Control+A');
+          await page.keyboard.type(unidade);
+          await page.keyboard.press('Enter');
+          return;
+        } catch {}
+      }
+    } catch {}
+  }
+}
+
+async function loginSEI(page) {
+  if (!process.env.SEI_URL || !process.env.SEI_USER || !process.env.SEI_PASSWORD) {
+    throw new Error('Para ROBOT_MODE=sei, preencha SEI_URL, SEI_USER e SEI_PASSWORD no Render.');
+  }
+
+  console.log('[SEI] Abrindo login...');
+  await page.goto(process.env.SEI_URL, { waitUntil: 'domcontentloaded', timeout: SEI_TIMEOUT_MS });
+
+  await fillFirstVisible(page, [
+    'input[name="txtUsuario"]', '#txtUsuario', 'input[id*=Usuario]', 'input[name*=Usuario]',
+    'input[type="text"]', 'input:not([type])'
+  ], process.env.SEI_USER);
+
+  await fillFirstVisible(page, [
+    'input[name="pwdSenha"]', '#pwdSenha', 'input[id*=Senha]', 'input[name*=Senha]', 'input[type="password"]'
+  ], process.env.SEI_PASSWORD);
+
+  await selectUnidade(page, process.env.SEI_UNIDADE || '');
+
+  await clickFirstVisible(page, [
+    'button:has-text("ACESSAR")', 'input[value="ACESSAR"]', 'button:has-text("Acessar")',
+    'input[type="submit"]', 'button[type="submit"]', 'text=ACESSAR'
+  ]);
+
+  await page.waitForLoadState('domcontentloaded', { timeout: SEI_TIMEOUT_MS }).catch(() => {});
+  await page.waitForTimeout(2500);
+  const body = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+  if (normalize(body).includes('captcha') || normalize(body).includes('senha invalida') || normalize(body).includes('usuario ou senha')) {
+    throw new Error('Falha no login do SEI. Robô parou para evitar novas tentativas/captcha.');
+  }
+  console.log('[SEI] Login finalizado ou sessão já autenticada.');
+}
+
+function allFrames(page) {
+  return page.frames();
+}
+
+async function findFrameContaining(page, text) {
+  const wanted = normalize(text);
+  for (const frame of allFrames(page)) {
+    try {
+      const body = await frame.locator('body').innerText({ timeout: 2000 });
+      if (normalize(body).includes(wanted)) return frame;
+    } catch {}
+  }
+  return page.mainFrame();
+}
+
+async function searchProcess(page, numeroProcesso) {
+  console.log(`[SEI] Pesquisando processo ${numeroProcesso}...`);
+  const frames = allFrames(page);
+  let filled = false;
+  for (const frame of frames) {
+    try {
+      const selectors = [
+        'input[placeholder*="Pesquisar"]', 'input[title*="Pesquisar"]', '#txtPesquisaRapida',
+        'input[name*=Pesquisa]', 'input[type="search"]'
+      ];
+      for (const sel of selectors) {
+        const loc = frame.locator(sel).first();
+        if (await loc.count() && await loc.isVisible({ timeout: 800 }).catch(() => false)) {
+          await loc.fill(numeroProcesso);
+          await loc.press('Enter');
+          filled = true;
+          break;
+        }
+      }
+      if (filled) break;
+    } catch {}
+  }
+  if (!filled) throw new Error('Não localizei o campo de pesquisa superior do SEI.');
+
+  await page.waitForLoadState('domcontentloaded', { timeout: SEI_TIMEOUT_MS }).catch(() => {});
+  await page.waitForTimeout(3000);
+
+  // Se aparecer o número do processo em resultado/tela, tenta clicar nele.
+  for (const frame of allFrames(page)) {
+    try {
+      const loc = frame.getByText(numeroProcesso, { exact: false }).first();
+      if (await loc.count() && await loc.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await loc.click().catch(() => {});
+        await page.waitForTimeout(2500);
+        break;
+      }
+    } catch {}
+  }
+}
+
+async function collectDocumentCandidates(page) {
+  const keywords = /(Informação|Informacao|Despacho|Ofício|Oficio|Memorando|Parecer|Anexo|Contrato|Termo|Nota Técnica|Nota Tecnica|Portaria)/i;
+  const candidates = [];
+  for (const frame of allFrames(page)) {
+    try {
+      const found = await frame.locator('a, span, div, td').evaluateAll((els) => {
+        const isVisible = (el) => {
+          const s = window.getComputedStyle(el);
+          const r = el.getBoundingClientRect();
+          return s && s.visibility !== 'hidden' && s.display !== 'none' && r.width > 0 && r.height > 0;
+        };
+        return els.map((el, idx) => ({ idx, text: (el.innerText || el.textContent || '').trim() }))
+          .filter(x => x.text && x.text.length < 220)
+          .filter((x, i, arr) => arr.findIndex(y => y.text === x.text) === i)
+          .filter(x => /Informação|Informacao|Despacho|Ofício|Oficio|Memorando|Parecer|Anexo|Contrato|Termo|Nota Técnica|Nota Tecnica|Portaria/i.test(x.text));
+      });
+      for (const f of found) candidates.push({ frame, text: f.text });
+    } catch {}
+  }
+
+  // Ordena na ordem encontrada, remove duplicados exatos e limita aos últimos documentos.
+  const unique = [];
+  const seen = new Set();
+  for (const c of candidates) {
+    const key = cleanText(c.text);
+    if (!seen.has(key)) { seen.add(key); unique.push(c); }
+  }
+  return unique.slice(-Math.max(1, SEI_MAX_DOCUMENTS));
+}
+
+async function clickDocumentAndRead(page, candidate) {
+  const label = candidate.text;
+  const frame = candidate.frame;
+  console.log(`[SEI] Abrindo documento: ${label}`);
+  const locs = [
+    frame.getByText(label, { exact: true }).first(),
+    frame.getByText(label, { exact: false }).first(),
+    frame.locator(`text=${label}`).first()
+  ];
+  let clicked = false;
+  for (const loc of locs) {
+    try {
+      if (await loc.count() && await loc.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await loc.click({ timeout: 5000 }); clicked = true; break;
+      }
+    } catch {}
+  }
+  if (!clicked) return { texto: '', erroLeitura: 'Não foi possível clicar no documento.' };
+
+  await page.waitForTimeout(3000);
+  // O documento costuma abrir no painel/iframe direito. Pegamos o frame com mais texto útil.
+  let best = '';
+  for (const f of allFrames(page)) {
+    try {
+      const txt = await f.locator('body').innerText({ timeout: 2000 });
+      const cleaned = cleanText(txt);
+      if (cleaned.length > best.length && !normalize(cleaned).includes('controle de processos')) best = cleaned;
+    } catch {}
+  }
+  if (!best) best = await page.locator('body').innerText({ timeout: 5000 }).catch(() => '');
+  return { texto: String(best || '').slice(0, 30000), erroLeitura: best ? null : 'Documento aberto, mas texto não foi encontrado.' };
+}
+
+async function getMovementsFromSEIReal(item) {
+  const { chromium } = await import('playwright');
+  const browser = await chromium.launch({
+    headless: SEI_HEADLESS,
+    args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+  });
+  const context = await browser.newContext({ viewport: { width: 1600, height: 900 }, ignoreHTTPSErrors: true });
+  const page = await context.newPage();
+  page.setDefaultTimeout(SEI_TIMEOUT_MS);
+
+  try {
+    await loginSEI(page);
+    await searchProcess(page, item.numero_processo);
+
+    const candidates = await collectDocumentCandidates(page);
+    console.log(`[SEI] Documentos candidatos encontrados: ${candidates.length}`);
+    if (!candidates.length) return [];
+
+    const selected = candidates.slice(-Math.max(1, SEI_READ_LAST_DOCUMENTS));
+    const movements = [];
+    for (const cand of selected) {
+      const { documento, id_sei } = parseDocumentName(cand.text);
+      const tipo_documento = inferDocumentType(documento);
+      const read = await clickDocumentAndRead(page, cand);
+      const texto = read.texto || '';
+      const setorMatch = cand.text.match(/SESAU-[A-Z0-9\-]+|GECONT|GPACC|CREG|PGE|CAD|CGAPP/i) || texto.match(/SESAU-[A-Z0-9\-]+|GECONT|GPACC|CREG|PGE|CAD|CGAPP/i);
+      const setor = setorMatch?.[0] || item.setor_interesse || item.setor_alerta || 'SEI';
+      const hoje = nowBR();
+      const hash = `sei:${item.numero_processo}:${id_sei || documento}`;
+      movements.push({
+        data_movimentacao: hoje,
+        setor,
+        tipo_documento,
+        documento,
+        id_sei,
+        texto_documento: texto,
+        resumo: read.erroLeitura ? `Movimentação identificada, mas o conteúdo não pôde ser lido: ${read.erroLeitura}` : `Documento ${documento} identificado pelo robô SEI.`,
+        hash_movimentacao: hash
+      });
+    }
+    return movements;
+  } finally {
+    await context.close().catch(() => {});
+    await browser.close().catch(() => {});
+  }
 }
 
 async function getMovementsFromSEI(item) {
@@ -213,25 +441,39 @@ async function getMovementsFromSEI(item) {
       tipo_documento: item.tipo_documento_interesse || item.tipo_documento_alerta || 'Despacho',
       documento: `Despacho teste ${dateKey}`,
       resumo: `Movimentação simulada pelo robô para validar o processo ${item.numero_processo}.`,
+      texto_documento: `Assunto: Solicitação de manifestação sobre vigência contratual.\n\nDocumento simulado do setor ${item.setor_interesse || item.setor_alerta || 'GECONT'} referente ao processo. Trata de análise/encaminhamento relacionado ao contrato monitorado, com necessidade de verificação pela equipe gestora.`,
       hash_movimentacao: `sim:${item.origem}:${item.id}:${dateKey}`
     }];
   }
 
-  console.warn('ROBOT_MODE=real ainda exige mapeamento dos seletores do SEI. Nenhuma movimentação real foi coletada.');
+  if (MODE === 'sei') return await getMovementsFromSEIReal(item);
+
+  console.warn(`ROBOT_MODE=${MODE} não reconhecido. Use simulation ou sei.`);
   return [];
+}
+
+async function readDocumentContent(_item, movement) {
+  return movement.texto_documento || '';
+}
+
+async function enrichMovementWithDocumentText(item, movement) {
+  const texto = await readDocumentContent(item, movement);
+  const assunto = extractDocumentSubject(texto, movement);
+  const resumoDoc = summarizeDocumentText(texto, movement);
+  return {
+    ...movement,
+    texto_documento: texto ? String(texto).slice(0, 12000) : null,
+    assunto_identificado: assunto,
+    resumo_documento: resumoDoc,
+    resumo: resumoDoc || movement.resumo
+  };
 }
 
 async function createDemandIfNeeded(item, movement, alerta) {
   if (!item.gerar_demanda || !item.contrato_id) return null;
   const titulo = `Verificar novo documento SEI - ${item.assunto}`.slice(0, 220);
   const active = ['Aberta', 'Em andamento', 'Aguardando resposta'];
-  const { data: existing } = await supabase
-    .from('demandas')
-    .select('id')
-    .eq('contrato_id', item.contrato_id)
-    .eq('titulo', titulo)
-    .in('status', active)
-    .maybeSingle();
+  const { data: existing } = await supabase.from('demandas').select('id').eq('contrato_id', item.contrato_id).eq('titulo', titulo).in('status', active).maybeSingle();
   if (existing?.id) return existing.id;
 
   const { data, error } = await supabase.from('demandas').insert({
@@ -246,10 +488,7 @@ async function createDemandIfNeeded(item, movement, alerta) {
 }
 
 async function generateExpiryDemands() {
-  const { data: contratos, error } = await supabase
-    .from('contratos')
-    .select('*')
-    .neq('situacao', 'Inativo');
+  const { data: contratos, error } = await supabase.from('contratos').select('*').neq('situacao', 'Inativo');
   if (error) throw error;
 
   let created = 0;
@@ -257,13 +496,7 @@ async function generateExpiryDemands() {
     const dias = daysUntil(c.data_fim);
     if (dias === null || dias < 0 || dias > 15) continue;
     const titulo = `Acompanhar Vigência do Contrato ${c.numero_contrato || 's/n'} - ${c.prestador || 'Prestador não informado'}`;
-    const { data: existing } = await supabase
-      .from('demandas')
-      .select('id')
-      .eq('contrato_id', c.id)
-      .eq('titulo', titulo)
-      .in('status', ['Aberta', 'Em andamento', 'Aguardando resposta'])
-      .maybeSingle();
+    const { data: existing } = await supabase.from('demandas').select('id').eq('contrato_id', c.id).eq('titulo', titulo).in('status', ['Aberta', 'Em andamento', 'Aguardando resposta']).maybeSingle();
     if (existing?.id) continue;
     const { error: dErr } = await supabase.from('demandas').insert({
       contrato_id: c.id,
@@ -281,9 +514,7 @@ async function generateExpiryDemands() {
 
 async function processItem(item) {
   const movements = await getMovementsFromSEI(item);
-  let newMovements = 0;
-  let alerts = 0;
-  let demands = 0;
+  let newMovements = 0, alerts = 0, demands = 0;
   const hadPrevious = await hasPreviousMovements(item);
 
   for (const baseMov of movements) {
@@ -300,8 +531,6 @@ async function processItem(item) {
     if (!movErr) newMovements++;
     if (movErr) continue;
 
-    // Regra de segurança: documento antigo não gera demanda e, se for muito antigo, nem alerta pendente.
-    // Primeira leitura: salva a referência inicial; só alerta se for recente, mas não gera demanda.
     if (!item.gerar_alerta || !ruleMatches(mov, item) || !recentForAlert) continue;
 
     const source_hash = `alert:${mov.hash_movimentacao}`;
@@ -326,11 +555,7 @@ async function processItem(item) {
       status: 'Pendente',
       gerar_demanda: podeGerarDemanda
     };
-    const { data: inserted, error: alertErr } = await supabase
-      .from('processo_alertas')
-      .insert(alertaPayload)
-      .select('*')
-      .single();
+    const { data: inserted, error: alertErr } = await supabase.from('processo_alertas').insert(alertaPayload).select('*').single();
     if (alertErr && !String(alertErr.message).toLowerCase().includes('duplicate')) throw alertErr;
     if (!alertErr) {
       alerts++;
@@ -349,7 +574,7 @@ async function processItem(item) {
     : supabase.from('processos_monitorados').update({ ultimo_monitoramento: nowBR(), ultima_movimentacao: movements[0]?.data_movimentacao || null }).eq('id', item.id);
   const { error: updateErr } = await update;
   if (updateErr) throw updateErr;
-  return { item: item.assunto, newMovements, alerts, demands };
+  return { item: item.assunto, processo: item.numero_processo, movementsFound: movements.length, newMovements, alerts, demands };
 }
 
 export async function runRobot() {
@@ -360,16 +585,18 @@ export async function runRobot() {
     const expiryDemands = await generateExpiryDemands();
     const items = await fetchMonitoredItems();
     const results = [];
-    for (const item of items) results.push(await processItem(item));
+    for (const item of items) {
+      try { results.push(await processItem(item)); }
+      catch (err) { console.error(`[ERRO item ${item.numero_processo}]`, err); results.push({ item: item.assunto, processo: item.numero_processo, error: err.message }); }
+    }
     lastResult = { startedAt, finishedAt: new Date().toISOString(), mode: MODE, demandDocumentRecencyDays: DEMAND_DOCUMENT_RECENCY_DAYS, alertDocumentRecencyDays: ALERT_DOCUMENT_RECENCY_DAYS, expiryDemands, monitored: items.length, results };
     console.log(JSON.stringify(lastResult, null, 2));
     return lastResult;
-  } finally {
-    running = false;
-  }
+  } finally { running = false; }
 }
 
 const app = express();
+app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
@@ -381,36 +608,23 @@ app.use((req, res, next) => {
 function checkTriggerToken(req, res) {
   const requiredToken = process.env.ROBOT_TRIGGER_TOKEN || '';
   if (!requiredToken) return true;
-  const token = req.headers['x-robot-token'] || req.query.token || '';
+  const token = req.headers['x-robot-token'] || req.query.token || req.body?.token || '';
   if (String(token) === String(requiredToken)) return true;
   res.status(401).json({ error: 'Token do robô inválido ou ausente.' });
   return false;
 }
 
-app.get('/', (_req, res) => {
-  res.json({
-    ok: true,
-    service: 'Robô SEI NIAR',
-    mode: MODE,
-    running,
-    endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'],
-    lastResult
-  });
-});
-
-app.get('/health', (_req, res) => res.json({ ok: true, mode: MODE, running, lastResult }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.0.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: '11.0.0', mode: MODE, running, lastResult }));
 
 async function handleManualRun(req, res) {
   if (!checkTriggerToken(req, res)) return;
   try { res.json(await runRobot()); }
-  catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+  catch (err) { console.error(err); res.status(500).json({ error: err.message, stack: SEI_DEBUG ? err.stack : undefined }); }
 }
 
-// Rota usada pelo site v10
 app.post('/run', handleManualRun);
 app.get('/run', handleManualRun);
-
-// Rota alternativa para teste manual no navegador
 app.post('/trigger', handleManualRun);
 app.get('/trigger', handleManualRun);
 
@@ -418,7 +632,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.0.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }
