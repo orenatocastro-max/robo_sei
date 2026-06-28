@@ -255,25 +255,31 @@ async function clickLoginAcessar(page) {
     '[role="button"]:has-text("ACESSAR")',
     '[role="button"]:has-text("Acessar")',
     '#btnAcessar', '#btnLogin', '#sbmLogin', '#btnEnviar', '#btnEntrar',
+    '.btn-primary', '.btn', '[onclick*="login" i]', '[onclick*="acess" i]', '[onclick*="entrar" i]',
     'input[name*=Acess]', 'input[id*=Acess]',
     'input[name*=Login]', 'input[id*=Login]',
     'input[type="submit"]', 'button[type="submit"]',
     'text=ACESSAR', 'text=Acessar',
-    'xpath=//*[contains(translate(normalize-space(.), "acessar", "ACESSAR"), "ACESSAR")]'
+    'xpath=//*[contains(translate(normalize-space(.), "abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ"), "ACESSAR")]'
   ];
 
-  // 1) tenta seletores normais na página principal e em todos os frames.
+  // 1) tenta seletores normais e clique forçado na página principal e frames.
   for (const ctx of [page, ...page.frames()]) {
-    try {
-      const method = await clickFirstVisible(ctx, selectors);
-      await page.waitForTimeout(1200);
-      return `selector:${method}`;
-    } catch {}
+    for (const sel of selectors) {
+      try {
+        const loc = ctx.locator(sel).first();
+        if (await loc.count() && await loc.isVisible({ timeout: 1200 }).catch(() => false)) {
+          await loc.click({ timeout: 5000 }).catch(async () => loc.click({ timeout: 5000, force: true }));
+          await page.waitForTimeout(1800);
+          return `selector:${sel}`;
+        }
+      } catch {}
+    }
   }
 
   console.log('[SEI] Clique normal no botão ACESSAR não funcionou. Tentando fallbacks robustos...');
 
-  // 2) tenta clicar em qualquer elemento visível que tenha texto/value/id/name parecido.
+  // 2) tenta clicar por elemento visível com texto/value/id/name/onClick parecido.
   for (const frame of page.frames()) {
     const clicked = await frame.evaluate(() => {
       const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase().trim();
@@ -282,38 +288,42 @@ async function clickLoginAcessar(page) {
         const st = window.getComputedStyle(el);
         return r.width > 5 && r.height > 5 && st.visibility !== 'hidden' && st.display !== 'none' && Number(st.opacity || 1) !== 0;
       };
-      const els = Array.from(document.querySelectorAll('input, button, a, div, span, label'));
+      const els = Array.from(document.querySelectorAll('input, button, a, div, span, label, td'));
       const target = els.find((el) => {
         if (!isVisible(el)) return false;
-        const txt = norm([el.innerText, el.textContent, el.value, el.id, el.name, el.title, el.getAttribute('aria-label')].filter(Boolean).join(' '));
+        const txt = norm([el.innerText, el.textContent, el.value, el.id, el.name, el.title, el.className, el.getAttribute('aria-label'), el.getAttribute('onclick')].filter(Boolean).join(' '));
         return txt.includes('ACESSAR') || txt.includes('ACESS') || txt.includes('LOGIN') || txt.includes('ENTRAR');
       });
       if (target) {
         const clickable = target.closest('button,input,a,[onclick]') || target;
+        clickable.scrollIntoView({ block: 'center', inline: 'center' });
         clickable.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true, view: window }));
         clickable.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
         clickable.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-        clickable.click();
+        clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+        try { clickable.click(); } catch {}
         return true;
       }
       return false;
     }).catch(() => false);
     if (clicked) {
-      await page.waitForTimeout(1800);
+      await page.waitForTimeout(2200);
       return 'fallback-dom-visible-text-click';
     }
   }
 
-  // 3) tenta submeter formulários e chamar funções comuns de login, se existirem.
+  // 3) tenta submeter formulário que contém o campo senha/usuário, e chamar funções comuns.
   for (const frame of page.frames()) {
     const submitted = await frame.evaluate(() => {
-      const candidates = ['login', 'logar', 'entrar', 'acessar', 'validarLogin', 'onSubmit', 'submitLogin'];
+      const candidates = ['login', 'logar', 'entrar', 'acessar', 'validarLogin', 'onSubmit', 'submitLogin', 'enviarLogin', 'autenticar'];
       for (const name of candidates) {
         try { if (typeof window[name] === 'function') { window[name](); return `function:${name}`; } } catch {}
       }
-      const forms = Array.from(document.forms || []);
-      for (const form of forms) {
+      const pwd = document.querySelector('input[type="password"], input[name*=Senha], input[id*=Senha]');
+      let form = pwd?.closest?.('form') || document.querySelector('form');
+      if (form) {
         try {
+          form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
           if (typeof form.requestSubmit === 'function') form.requestSubmit();
           else form.submit();
           return 'form-submit';
@@ -322,63 +332,86 @@ async function clickLoginAcessar(page) {
       return '';
     }).catch(() => '');
     if (submitted) {
-      await page.waitForTimeout(1800);
+      await page.waitForTimeout(2200);
       return `fallback-${submitted}`;
     }
   }
 
-  // 4) tentativa por teclado: senha -> Tab -> Enter, e unidade -> Tab -> Enter.
-  try {
-    const pwd = page.locator('input[type="password"]').first();
-    if (await pwd.count()) {
-      await pwd.focus();
-      await page.keyboard.press('Tab');
-      await page.keyboard.press('Tab');
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(1800);
-      return 'fallback-keyboard-tab-enter';
-    }
-  } catch {}
+  // 4) tentativa por coordenada configurável no Render.
+  const envX = Number(process.env.SEI_LOGIN_CLICK_X || 0);
+  const envY = Number(process.env.SEI_LOGIN_CLICK_Y || 0);
+  if (envX > 0 && envY > 0) {
+    console.log(`[SEI] Tentando clique por coordenada configurada SEI_LOGIN_CLICK_X/Y: x=${envX}, y=${envY}...`);
+    await page.mouse.click(envX, envY);
+    await page.waitForTimeout(2200);
+    return 'fallback-env-coordinate-click';
+  }
 
-  // 5) tentativa por coordenada: clica abaixo do último campo visível do formulário.
+  // 5) tentativa por coordenada calculada: centro do botão abaixo do campo de unidade/senha.
   try {
-    const boxes = await page.evaluate(() => {
+    const point = await page.evaluate(() => {
       const visible = (el) => {
         const r = el.getBoundingClientRect();
         const st = getComputedStyle(el);
         return r.width > 20 && r.height > 15 && st.display !== 'none' && st.visibility !== 'hidden';
       };
-      return Array.from(document.querySelectorAll('input, select'))
+      const buttonLike = Array.from(document.querySelectorAll('input, button, a, div, span'))
+        .filter(visible)
+        .map((el) => {
+          const r = el.getBoundingClientRect();
+          const txt = String([el.innerText, el.textContent, el.value, el.id, el.name, el.className].filter(Boolean).join(' ')).toUpperCase();
+          return { x: r.x, y: r.y, width: r.width, height: r.height, txt };
+        })
+        .find((r) => r.txt.includes('ACESS') || r.txt.includes('ENTRAR') || r.txt.includes('LOGIN'));
+      if (buttonLike) return { x: buttonLike.x + buttonLike.width / 2, y: buttonLike.y + buttonLike.height / 2, kind: 'buttonLike' };
+      const boxes = Array.from(document.querySelectorAll('input, select'))
         .filter(visible)
         .map((el) => {
           const r = el.getBoundingClientRect();
           return { x: r.x, y: r.y, width: r.width, height: r.height };
         })
         .sort((a,b) => a.y - b.y);
+      if (boxes.length) {
+        const last = boxes[boxes.length - 1];
+        return { x: last.x + last.width / 2, y: last.y + last.height + 45, kind: 'belowLastInput' };
+      }
+      return null;
     });
-    if (boxes && boxes.length) {
-      const last = boxes[boxes.length - 1];
-      const x = last.x + last.width / 2;
-      const y = last.y + last.height + 45;
-      console.log(`[SEI] Tentando clique por coordenada aproximada em x=${Math.round(x)}, y=${Math.round(y)}...`);
-      await page.mouse.click(x, y);
-      await page.waitForTimeout(1800);
-      return 'fallback-coordinate-click';
+    if (point) {
+      console.log(`[SEI] Tentando clique por coordenada calculada (${point.kind}) em x=${Math.round(point.x)}, y=${Math.round(point.y)}...`);
+      await page.mouse.click(point.x, point.y);
+      await page.waitForTimeout(2200);
+      return 'fallback-calculated-coordinate-click';
     }
   } catch {}
 
-  // 6) último recurso: Enter direto no campo senha novamente.
+  // 6) tentativa por teclado: senha -> Enter / Tab Enter.
   try {
     const pwd = page.locator('input[type="password"]').first();
     if (await pwd.count()) {
       await pwd.focus();
-      await pwd.press('Enter');
-      await page.waitForTimeout(1800);
-      return 'fallback-password-enter';
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(1500);
+      await pwd.focus();
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Tab');
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(2200);
+      return 'fallback-password-enter-tab-enter';
     }
   } catch {}
 
-  throw new Error(`Não localizei/acionou botão ACESSAR. Seletores e fallbacks testados: ${selectors.join(', ')}, dom-visible-text-click, js-function/form-submit, keyboard-tab-enter, coordinate-click, password-enter`);
+  // 7) salva diagnóstico textual no log para calibrar.
+  try {
+    const diag = await page.evaluate(() => Array.from(document.querySelectorAll('input, button, a, select'))
+      .map((el) => {
+        const r = el.getBoundingClientRect();
+        return `${el.tagName} id=${el.id||''} name=${el.name||''} type=${el.type||''} value=${el.value||''} text=${(el.innerText||el.textContent||'').trim()} x=${Math.round(r.x)} y=${Math.round(r.y)} w=${Math.round(r.width)} h=${Math.round(r.height)}`;
+      }).slice(0, 40).join('\n'));
+    console.log('[SEI][DEBUG LOGIN ELEMENTOS]\n' + diag);
+  } catch {}
+
+  throw new Error(`Não localizei/acionou botão ACESSAR. Seletores e fallbacks testados: ${selectors.join(', ')}, dom-visible-text-click, js-function/form-submit, env-coordinate-click, calculated-coordinate-click, keyboard-enter, debug-elements`);
 }
 
 async function selectUnidade(page, unidade) {
@@ -992,7 +1025,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.6.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.7.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }

@@ -1,4 +1,4 @@
-# Robô SEI NIAR v11.6 - Login por coordenada e fallback robusto
+# Robô SEI NIAR v11.7 - Login por coordenada e fallback robusto
 
 Correção focada no login do SEI quando o botão **ACESSAR** não é encontrado como `button`, `input` ou texto comum.
 
@@ -9,7 +9,7 @@ Correção focada no login do SEI quando o botão **ACESSAR** não é encontrado
 - Alerta fallback quando não conseguir ler o conteúdo
 - Token `/trigger`
 
-## Novidades v11.6
+## Novidades v11.7
 
 - Tenta clicar em `input`, `button`, `a`, `div`, `span`, `label` com texto/value/id/name parecido com ACESSAR/LOGIN/ENTRAR
 - Tenta executar funções comuns de login no JavaScript da página
@@ -46,3 +46,15 @@ SEI_READ_LAST_DOCUMENTS=1
 SEI_HEADLESS=true
 SEI_DEBUG=false
 ```
+
+
+## v11.7 - Login por clique calibrável
+
+Se o SEI ainda não acionar o botão ACESSAR, adicione no Render:
+
+```env
+SEI_LOGIN_CLICK_X=640
+SEI_LOGIN_CLICK_Y=430
+```
+
+Essas coordenadas são usadas como fallback para clicar visualmente no botão. Se não funcionar, confira no log `[SEI][DEBUG LOGIN ELEMENTOS]` as coordenadas dos elementos visíveis e ajuste X/Y.
