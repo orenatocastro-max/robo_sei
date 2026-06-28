@@ -1,4 +1,4 @@
-Robô SEI NIAR v11.4
+Robô SEI NIAR v11.5
 
 Substitua no GitHub do robô os arquivos desta pasta.
 Depois, no Render, execute: Manual Deploy > Clear build cache & deploy.

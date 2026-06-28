@@ -1,4 +1,4 @@
-# Robô SEI NIAR v11.4 — Leitura robusta e validada do documento
+# Robô SEI NIAR v11.5 — Login robusto + leitura robusta e validada do documento
 
 Esta versão melhora a abertura/leitura do documento no SEI.
 

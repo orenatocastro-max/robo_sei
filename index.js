@@ -234,12 +234,73 @@ async function clickFirstVisible(pageOrFrame, selectors) {
     try {
       const loc = pageOrFrame.locator(sel).first();
       if (await loc.count() && await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await loc.click();
+        await loc.click({ timeout: 5000 });
         return sel;
       }
     } catch {}
   }
   throw new Error(`Não localizei botão/link. Seletores testados: ${selectors.join(', ')}`);
+}
+
+async function clickLoginAcessar(page) {
+  const selectors = [
+    'input[value="ACESSAR"]',
+    'input[value*="ACESS"]',
+    'input[type="button"][value*="ACESS"]',
+    'input[type="submit"][value*="ACESS"]',
+    'button:has-text("ACESSAR")',
+    'button:has-text("Acessar")',
+    '#btnAcessar', '#btnLogin', '#sbmLogin', '#btnEnviar', '#btnEntrar',
+    'input[name*=Acess]', 'input[id*=Acess]',
+    'input[name*=Login]', 'input[id*=Login]',
+    'input[type="submit"]', 'button[type="submit"]',
+    'text=ACESSAR', 'text=Acessar'
+  ];
+
+  try {
+    return await clickFirstVisible(page, selectors);
+  } catch (err) {
+    console.log('[SEI] Clique normal no botão ACESSAR não funcionou. Tentando fallback por JavaScript/Enter...');
+  }
+
+  // Fallback 1: procurar qualquer input/button/anchor cujo texto, value, id ou name contenha ACESS/LOGIN/ENTRAR.
+  const clicked = await page.evaluate(() => {
+    const norm = (v) => String(v || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toUpperCase();
+    const els = Array.from(document.querySelectorAll('input, button, a'));
+    const target = els.find((el) => {
+      const txt = norm(el.innerText || el.textContent || el.value || el.id || el.name || el.title || el.getAttribute('aria-label'));
+      return txt.includes('ACESS') || txt.includes('LOGIN') || txt.includes('ENTRAR');
+    });
+    if (target) {
+      target.click();
+      return true;
+    }
+    return false;
+  }).catch(() => false);
+  if (clicked) return 'fallback-js-click-login';
+
+  // Fallback 2: submeter o primeiro formulário da página.
+  const submitted = await page.evaluate(() => {
+    const forms = Array.from(document.forms || []);
+    if (forms.length) {
+      if (typeof forms[0].requestSubmit === 'function') forms[0].requestSubmit();
+      else forms[0].submit();
+      return true;
+    }
+    return false;
+  }).catch(() => false);
+  if (submitted) return 'fallback-form-submit';
+
+  // Fallback 3: Enter no campo de senha.
+  try {
+    const pwd = page.locator('input[type="password"]').first();
+    if (await pwd.count()) {
+      await pwd.press('Enter');
+      return 'fallback-password-enter';
+    }
+  } catch {}
+
+  throw new Error(`Não localizei/acionou botão ACESSAR. Seletores e fallbacks testados: ${selectors.join(', ')}, fallback-js-click-login, fallback-form-submit, fallback-password-enter`);
 }
 
 async function selectUnidade(page, unidade) {
@@ -283,10 +344,8 @@ async function loginSEI(page) {
 
   await selectUnidade(page, process.env.SEI_UNIDADE || '');
 
-  await clickFirstVisible(page, [
-    'button:has-text("ACESSAR")', 'input[value="ACESSAR"]', 'button:has-text("Acessar")',
-    'input[type="submit"]', 'button[type="submit"]', 'text=ACESSAR'
-  ]);
+  const loginClickMethod = await clickLoginAcessar(page);
+  console.log(`[SEI] Acesso acionado por: ${loginClickMethod}`);
 
   await page.waitForLoadState('domcontentloaded', { timeout: SEI_TIMEOUT_MS }).catch(() => {});
   await page.waitForTimeout(2500);
@@ -855,7 +914,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.4.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.5.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }
