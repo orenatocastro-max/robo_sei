@@ -1,27 +1,16 @@
-# Robô SEI NIAR v11.8 - Correção de campos em frames
-
-Esta versão corrige falhas na tela de login quando o SEI renderiza os campos de usuário/senha em estrutura diferente ou dentro de frame.
+# Robô SEI NIAR v11.9 - leitura segura e alerta limpo
 
 Melhorias:
-- procura campos de usuário/senha em todos os frames;
-- aceita input text, tel, number, email e autocomplete;
-- fallback por heurística para preencher o primeiro campo visível e o campo password;
-- imprime diagnóstico dos campos sem expor valores digitados;
-- mantém correções anteriores de botão ACESSAR e leitura robusta.
+- descarta texto da árvore do processo como se fosse documento;
+- só confirma leitura quando encontra sinais confiáveis de documento;
+- assunto específico só é gerado quando houver padrão confiável como `Assunto:`, `Referência:` ou conteúdo confirmado;
+- se não conseguir ler, gera alerta seguro sem inventar assunto;
+- salva `nivel_alerta`, `leitura_confirmada`, `estrategia_leitura`, `erro_leitura` e `tentativas_leitura`.
 
-No Render, mantenha:
+Start Command no Render:
 
 ```bash
 npx playwright install chromium && node index.js
 ```
 
-Variáveis principais:
-
-```env
-ROBOT_MODE=sei
-SEI_URL=...
-SEI_USER=...
-SEI_PASSWORD=...
-SEI_UNIDADE=JP II
-SEI_DEBUG=true
-```
+Mantenha `ROBOT_MODE=sei` para SEI real.

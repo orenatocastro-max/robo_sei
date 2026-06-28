@@ -44,61 +44,76 @@ function cleanText(text = '') {
   return String(text).replace(/\s+/g, ' ').replace(/ /g, ' ').trim();
 }
 
+
+function looksLikeProcessTreeText(text = '') {
+  const raw = String(text || '');
+  const clean = cleanText(raw);
+  const n = normalize(clean);
+  const romanSeq = /\bI\s+II\s+III\s+IV\s+V\b/.test(clean);
+  const manyDocNames = (clean.match(/\b(Despacho|Informação|Ofício|Memorando|Parecer|Anexo|Certidão|Consulta|Comunicação|Contrato)\b/gi) || []).length >= 8;
+  const manyIds = (clean.match(/\(\d{6,}\)/g) || []).length >= 8;
+  const hasTreeTerms = n.includes('controle de processos') || n.includes('processos recebidos') || n.includes('processos gerados') || n.includes('acompanhamento especial');
+  const lacksDocumentHeader = !/(governo do estado|secretaria|núcleo|nucleo|assunto\s*:|refer[êe]ncia\s*:|ao senhor|senhor\(a\)|despacho|informa[cç][aã]o\s*n[ºo])/i.test(clean);
+  return hasTreeTerms || romanSeq || (manyDocNames && manyIds && lacksDocumentHeader);
+}
+
+function safeFallbackSubject(movement = {}) {
+  const tipo = movement.tipo_documento || 'Documento';
+  return `Novo ${tipo} inserido no processo`;
+}
+
+function safeFallbackSummary(movement = {}) {
+  if (movement.erro_leitura) return `Movimentação nova identificada no processo monitorado, porém o conteúdo do documento não pôde ser lido/confirmado automaticamente. Motivo: ${movement.erro_leitura}`;
+  return `Movimentação nova identificada no processo monitorado. Verifique o teor do documento no SEI para confirmar as providências necessárias.`;
+}
+
 function extractDocumentSubject(text = '', movement = {}) {
   const raw = String(text || '').trim();
-  const normalized = normalize(raw);
-  const tipo = movement.tipo_documento || movement.documento || 'Documento';
+  if (!raw || looksLikeProcessTreeText(raw) || movement.leitura_confirmada === false) return safeFallbackSubject(movement);
 
+  // Só considera assunto específico quando há padrão explícito no documento.
   const explicitPatterns = [
-    /assunto\s*[:\-]\s*(.+)/i,
-    /ementa\s*[:\-]\s*(.+)/i,
-    /refer[êe]ncia\s*[:\-]\s*(.+)/i,
-    /objeto\s*[:\-]\s*(.+)/i
+    /^\s*assunto\s*[:\-]\s*(.+)$/im,
+    /^\s*ementa\s*[:\-]\s*(.+)$/im,
+    /^\s*refer[êe]ncia\s*[:\-]\s*(.+)$/im,
+    /^\s*objeto\s*[:\-]\s*(.+)$/im
   ];
   for (const pattern of explicitPatterns) {
     const match = raw.match(pattern);
     if (match?.[1]) return cleanText(match[1]).slice(0, 220);
   }
 
+  const normalized = normalize(raw);
   const themes = [
     ['termo aditivo', 'Termo aditivo / alteração contratual'],
-    ['aditivo', 'Termo aditivo / alteração contratual'],
     ['apostilamento', 'Apostilamento contratual'],
     ['prorrogacao', 'Prorrogação de vigência contratual'],
-    ['vigencia', 'Vigência contratual'],
     ['reequilibrio', 'Reequilíbrio econômico-financeiro'],
-    ['valor', 'Atualização ou análise de valores'],
     ['errata', 'Errata / correção documental'],
-    ['correcao', 'Correção documental ou cadastral'],
-    ['manifestacao', 'Solicitação de manifestação técnica'],
-    ['encaminha', 'Encaminhamento para análise'],
-    ['despacho', 'Despacho / encaminhamento no processo'],
     ['nota tecnica', 'Nota técnica / análise técnica'],
     ['pagamento', 'Pagamento / faturamento'],
     ['fiscalizacao', 'Fiscalização contratual'],
     ['notificacao', 'Notificação ou comunicação formal'],
-    ['oficio', 'Ofício / comunicação externa'],
-    ['informacao', 'Informação técnica / resposta administrativa']
+    ['oficio', 'Ofício / comunicação externa']
   ];
   for (const [key, label] of themes) if (normalized.includes(key)) return label;
-
-  const line = firstNonEmptyLine(raw);
-  if (line) return cleanText(line).slice(0, 220);
-  return `Novo ${tipo} identificado no processo`;
+  return safeFallbackSubject(movement);
 }
 
 function summarizeDocumentText(text = '', movement = {}) {
   const raw = cleanText(text);
-  if (!raw) return movement.resumo || `Novo documento/movimentação identificado pelo robô SEI: ${movement.documento || movement.tipo_documento || 'documento'}.`;
+  if (!raw || looksLikeProcessTreeText(raw) || movement.leitura_confirmada === false) return safeFallbackSummary(movement);
 
-  const assuntoMatch = raw.match(/assunto\s*[:\-]\s*([^\n\.]+[\.]?)/i);
-  const interessadoMatch = raw.match(/(ao senhor|a senhora|interessad[oa]|empresa|contratada)\s*[:\-]?\s*([^\n\.]{10,180})/i);
+  const assuntoMatch = raw.match(/^\s*assunto\s*[:\-]\s*(.+)$/im);
+  const referenciaMatch = raw.match(/^\s*refer[êe]ncia\s*[:\-]\s*(.+)$/im);
+  const interessadoMatch = raw.match(/^(?:ao senhor|a senhora|interessad[oa]|empresa|contratada)\s*[:\-]?\s*(.+)$/im);
   const firstSentences = raw.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [raw];
   const parts = [];
   if (assuntoMatch?.[0]) parts.push(cleanText(assuntoMatch[0]));
+  if (referenciaMatch?.[0]) parts.push(cleanText(referenciaMatch[0]));
   if (interessadoMatch?.[0]) parts.push(cleanText(interessadoMatch[0]));
-  parts.push(...firstSentences.slice(0, 2).map(cleanText));
-  return [...new Set(parts)].join(' ').slice(0, 700);
+  parts.push(...firstSentences.slice(0, 2).map(cleanText).filter(x => x.length > 20));
+  return [...new Set(parts)].join(' ').slice(0, 700) || safeFallbackSummary(movement);
 }
 
 function parseDocumentName(text = '') {
@@ -666,10 +681,13 @@ async function readBestDocumentText(page) {
       const txt = await f.locator('body').innerText({ timeout: 2500 });
       const cleaned = cleanText(txt);
       const n = normalize(cleaned);
-      // Ignora menu/árvore do SEI quando há outro frame com texto maior.
-      const penalty = n.includes('controle de processos') || n.includes('menu principal') || n.includes('arvore') ? 3000 : 0;
-      const score = Math.max(0, cleaned.length - penalty);
-      const bestScore = Math.max(0, best.length - (normalize(best).includes('controle de processos') ? 3000 : 0));
+      // Pontua melhor frames que parecem conter documento e penaliza árvore/menu do SEI.
+      const isTree = looksLikeProcessTreeText(cleaned);
+      const hasDocHeader = /(governo do estado|secretaria|núcleo|nucleo|assunto\s*:|refer[êe]ncia\s*:|ao senhor|senhor\(a\)|informa[cç][aã]o\s*n[ºo]|despacho)/i.test(cleaned);
+      const penalty = isTree ? 100000 : 0;
+      const bonus = hasDocHeader ? 20000 : 0;
+      const score = Math.max(0, cleaned.length + bonus - penalty);
+      const bestScore = Math.max(0, best.length + (/(assunto\s*:|governo do estado|secretaria)/i.test(best) ? 20000 : 0) - (looksLikeProcessTreeText(best) ? 100000 : 0));
       if (score > bestScore) {
         best = cleaned;
         bestFrameUrl = f.url();
@@ -689,16 +707,17 @@ function validateReadText(text = '', candidate = {}) {
   const clean = cleanText(text);
   const n = normalize(clean);
 
+  const isTree = looksLikeProcessTreeText(clean);
   const hasMinText = clean.length >= 120;
   const hasId = id ? n.includes(normalize(id)) : false;
   const hasTipo = tipo ? n.includes(normalize(tipo)) : false;
   const hasDocName = docName ? n.includes(normalize(docName).slice(0, 30)) : false;
-  const hasUsefulSEIText = /(assunto|refer[êe]ncia|interessad|senhor|despacho|informa[cç][aã]o|of[ií]cio|documento|processo)/i.test(clean);
+  const hasExplicitSubject = /^\s*(assunto|refer[êe]ncia|objeto|ementa)\s*[:\-]/im.test(clean);
+  const hasDocumentHeader = /(governo do estado|secretaria|núcleo|nucleo|ao senhor|senhor\(a\)|informa[cç][aã]o\s*n[ºo]|despacho\s*n[ºo]?)/i.test(clean);
 
-  // Não exige todos os critérios, porque alguns documentos SEI não repetem o ID no corpo.
-  const confirmed = hasMinText && (hasId || hasTipo || hasDocName || hasUsefulSEIText);
-  const reason = confirmed ? null : `Leitura não confirmada. minText=${hasMinText}, id=${hasId}, tipo=${hasTipo}, nome=${hasDocName}, textoUtil=${hasUsefulSEIText}`;
-  return { confirmed, reason, hasMinText, hasId, hasTipo, hasDocName, hasUsefulSEIText };
+  const confirmed = hasMinText && !isTree && (hasId || hasTipo || hasDocName || hasExplicitSubject || hasDocumentHeader);
+  const reason = confirmed ? null : `Leitura não confirmada. minText=${hasMinText}, arvore=${isTree}, id=${hasId}, tipo=${hasTipo}, nome=${hasDocName}, assuntoExplicito=${hasExplicitSubject}, cabecalho=${hasDocumentHeader}`;
+  return { confirmed, reason, hasMinText, isTree, hasId, hasTipo, hasDocName, hasExplicitSubject, hasDocumentHeader };
 }
 
 async function tryLocatorClick(page, candidate, loc, name) {
@@ -890,18 +909,20 @@ async function readDocumentContent(_item, movement) {
 }
 
 async function enrichMovementWithDocumentText(item, movement) {
-  const texto = await readDocumentContent(item, movement);
-  const assunto = extractDocumentSubject(texto, movement);
-  const resumoDoc = summarizeDocumentText(texto, movement);
-  const fallbackResumo = movement.erro_leitura
-    ? `Movimentação nova identificada, mas o conteúdo do documento não pôde ser lido automaticamente. Motivo: ${movement.erro_leitura}`
-    : movement.resumo;
+  const textoOriginal = await readDocumentContent(item, movement);
+  const textoValido = textoOriginal && !looksLikeProcessTreeText(textoOriginal) && movement.leitura_confirmada !== false;
+  const texto = textoValido ? textoOriginal : '';
+  const movementForSummary = textoValido ? movement : { ...movement, leitura_confirmada: false, erro_leitura: movement.erro_leitura || 'Texto capturado não foi considerado conteúdo confiável do documento.' };
+  const assunto = extractDocumentSubject(texto, movementForSummary);
+  const resumoDoc = summarizeDocumentText(texto, movementForSummary);
   return {
     ...movement,
+    leitura_confirmada: textoValido ? movement.leitura_confirmada : false,
+    erro_leitura: textoValido ? movement.erro_leitura : (movement.erro_leitura || 'Texto capturado não foi considerado conteúdo confiável do documento.'),
     texto_documento: texto ? String(texto).slice(0, 12000) : null,
-    assunto_identificado: assunto || `Novo documento no processo`,
-    resumo_documento: resumoDoc || fallbackResumo,
-    resumo: resumoDoc || fallbackResumo
+    assunto_identificado: assunto || safeFallbackSubject(movementForSummary),
+    resumo_documento: resumoDoc || safeFallbackSummary(movementForSummary),
+    resumo: resumoDoc || safeFallbackSummary(movementForSummary)
   };
 }
 
@@ -1005,11 +1026,16 @@ async function processItem(item) {
       numero_processo: item.numero_processo,
       titulo: mov.assunto_identificado ? `${prefixoInformativo}${mov.assunto_identificado} - ${item.numero_processo}` : `${prefixoInformativo}Novo documento no processo ${item.numero_processo}`,
       descricao: primeiraLeitura
-        ? `Primeira leitura do processo. O documento foi registrado como referência inicial. ${leituraStatus} ${mov.resumo_documento || mov.resumo || ''}`
-        : `${leituraStatus} ${mov.resumo_documento || mov.resumo || `Documento ${mov.documento} identificado pelo robô SEI.`}`,
+        ? `Primeira leitura do processo. Documento registrado como referência inicial. ${leituraStatus}`
+        : `${leituraStatus} ${mov.resumo_documento || `Documento ${mov.documento} identificado pelo robô SEI.`}`,
       assunto_identificado: mov.assunto_identificado || null,
       resumo_documento: mov.resumo_documento || null,
       texto_documento: mov.texto_documento || null,
+      estrategia_leitura: mov.estrategia_leitura || null,
+      leitura_confirmada: !!mov.leitura_confirmada,
+      erro_leitura: mov.erro_leitura || null,
+      tentativas_leitura: mov.tentativas_leitura || null,
+      nivel_alerta: alertaInformativo ? 'informativo' : 'normal',
       setor: mov.setor,
       tipo_documento: mov.tipo_documento,
       documento: mov.documento,
@@ -1077,8 +1103,8 @@ function checkTriggerToken(req, res) {
   return false;
 }
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.4.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: '11.4.0', mode: MODE, running, lastResult }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.9.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: '11.9.0', mode: MODE, running, lastResult }));
 
 async function handleManualRun(req, res) {
   if (!checkTriggerToken(req, res)) return;
@@ -1095,7 +1121,7 @@ if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });
 } else {
   const port = Number(process.env.PORT || 3000);
-  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.8.0`));
+  app.listen(port, () => console.log(`Robô SEI NIAR rodando na porta ${port}. Modo: ${MODE}. Versão 11.9.0`));
   setInterval(() => runRobot().catch(err => console.error(err)), Math.max(5, INTERVAL_MINUTES) * 60 * 1000);
   setTimeout(() => runRobot().catch(err => console.error(err)), 5000);
 }
