@@ -1,2 +1,5 @@
-Substitua os arquivos do repositório do robô no GitHub e faça Clear build cache & deploy no Render.
-Versão v11.9: leitura mais segura, evita usar árvore do processo como conteúdo do documento.
+Robô SEI NIAR v14
+
+Atualize os arquivos no GitHub do robô e faça deploy no Render.
+Rode o SQL schema_robo_v14_lotes.sql no Supabase.
+Esta versão faz varredura em lotes e retoma automaticamente sem reler processos já verificados na mesma execução.

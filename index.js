@@ -25,8 +25,13 @@ const SEI_MAX_DOCUMENTS = Number(process.env.SEI_MAX_DOCUMENTS || 40);
 const SEI_READ_LAST_DOCUMENTS = Number(process.env.SEI_READ_LAST_DOCUMENTS || 1);
 const SEI_HEADLESS = String(process.env.SEI_HEADLESS || 'true').toLowerCase() !== 'false';
 const SEI_DEBUG = String(process.env.SEI_DEBUG || 'false').toLowerCase() === 'true';
-const VERSION = '13.0.0';
+const VERSION = '14.0.0';
+const ROBOT_BATCH_SIZE = Number(process.env.ROBOT_BATCH_SIZE || 5);
+const ROBOT_TIME_BUDGET_MINUTES = Number(process.env.ROBOT_TIME_BUDGET_MINUTES || 10);
+const ROBOT_SELF_RESUME_DELAY_SECONDS = Number(process.env.ROBOT_SELF_RESUME_DELAY_SECONDS || 30);
+const ROBOT_EXECUTION_STALE_MINUTES = Number(process.env.ROBOT_EXECUTION_STALE_MINUTES || 30);
 let running = false;
+let runningStartedAt = null;
 let lastResult = null;
 
 function nowBR() {
@@ -1181,62 +1186,237 @@ async function updateRobotExecution(execId, patch) {
   catch (err) { console.warn('[ROBO] Falha ao atualizar execução:', err.message); }
 }
 
-async function saveRobotExecutionItem(execId, item, result) {
-  if (!execId) return;
-  try {
-    await supabase.from('robo_execucao_itens').insert({
-      execucao_id: execId,
-      item_nome: item.assunto || item.prestador || item.numero_processo,
-      numero_processo: item.numero_processo,
-      origem: item.origem,
-      status: result.error ? 'Erro' : 'Verificado',
-      mensagem: result.error || (result.newMovements ? 'Movimentação nova identificada' : 'Sem novidade'),
-      documento: result.documento || null,
-      movimentos: result.newMovements || 0,
-      alertas: result.alerts || 0,
-      demandas: result.demands || 0
-    });
-  } catch (err) { console.warn('[ROBO] Falha ao registrar item da execução:', err.message); }
+function robotItemKey(item) {
+  return `${item.origem || 'processo'}:${item.id || item.contrato_id || item.processo_monitorado_id || item.numero_processo}`;
 }
 
-export async function runRobot() {
-  if (running) return { status: 'already-running' };
+async function saveRobotExecutionItem(execId, item, result, ordem = null) {
+  if (!execId) return;
+  const payload = {
+    execucao_id: execId,
+    item_nome: item.assunto || item.prestador || item.numero_processo,
+    numero_processo: item.numero_processo,
+    origem: item.origem,
+    status: result.error ? 'Erro' : 'Verificado',
+    mensagem: result.error || (result.newMovements ? 'Movimentação nova identificada' : 'Sem novidade'),
+    documento: result.documento || result.ultimoDocumento || null,
+    movimentos: result.newMovements || 0,
+    alertas: result.alerts || 0,
+    demandas: result.demands || 0,
+    item_key: robotItemKey(item),
+    item_id: item.id || item.contrato_id || item.processo_monitorado_id || null,
+    ordem,
+    inicio_item: result.inicioItem || null,
+    fim_item: result.fimItem || null,
+    duracao_ms: result.duracaoMs || null
+  };
+  try {
+    await supabase.from('robo_execucao_itens').insert(payload);
+  } catch (err) {
+    // Compatibilidade caso o SQL novo ainda não tenha sido rodado.
+    const { item_key, item_id, ordem, inicio_item, fim_item, duracao_ms, ...legacyPayload } = payload;
+    try { await supabase.from('robo_execucao_itens').insert(legacyPayload); }
+    catch (err2) { console.warn('[ROBO] Falha ao registrar item da execução:', err2.message); }
+  }
+}
+
+async function getLatestResumableExecution() {
+  try {
+    const { data, error } = await supabase
+      .from('robo_execucoes')
+      .select('*')
+      .in('status', ['Em andamento', 'Pausada para continuação', 'Possível travamento'])
+      .order('inicio', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error || !data) return null;
+    const inicio = data.inicio ? new Date(data.inicio) : null;
+    if (!inicio || Number.isNaN(inicio.getTime())) return data;
+    const ageMinutes = (Date.now() - inicio.getTime()) / 60000;
+    if (ageMinutes > ROBOT_EXECUTION_STALE_MINUTES * 4) return null;
+    return data;
+  } catch (err) {
+    console.warn('[ROBO] Não foi possível consultar execução retomável:', err.message);
+    return null;
+  }
+}
+
+async function getProcessedItemKeys(execId) {
+  if (!execId) return new Set();
+  try {
+    const { data, error } = await supabase
+      .from('robo_execucao_itens')
+      .select('item_key,origem,numero_processo,status')
+      .eq('execucao_id', execId)
+      .neq('status', 'Erro');
+    if (error) throw error;
+    const keys = new Set();
+    for (const row of data || []) {
+      if (row.item_key) keys.add(row.item_key);
+      else if (row.origem && row.numero_processo) keys.add(`${row.origem}:${row.numero_processo}`);
+    }
+    return keys;
+  } catch (err) {
+    console.warn('[ROBO] Não foi possível recuperar itens já verificados:', err.message);
+    return new Set();
+  }
+}
+
+function shouldStopBatch(batchStartedAt, processedInBatch) {
+  if (processedInBatch >= ROBOT_BATCH_SIZE) return true;
+  const elapsedMinutes = (Date.now() - batchStartedAt) / 60000;
+  return elapsedMinutes >= ROBOT_TIME_BUDGET_MINUTES;
+}
+
+function scheduleSelfResume() {
+  const delay = Math.max(5, ROBOT_SELF_RESUME_DELAY_SECONDS) * 1000;
+  console.log(`[ROBO] Agendando retomada automática em ${Math.round(delay / 1000)}s...`);
+  setTimeout(() => {
+    runRobot({ resumedByTimer: true }).catch(err => console.error('[ROBO] Falha na retomada automática:', err));
+  }, delay);
+}
+
+export async function runRobot(options = {}) {
+  if (running) {
+    const runningAge = runningStartedAt ? (Date.now() - runningStartedAt.getTime()) / 60000 : 0;
+    if (runningAge > ROBOT_EXECUTION_STALE_MINUTES) {
+      console.warn(`[ROBO] Execução em memória parecia travada há ${runningAge.toFixed(1)} min. Liberando trava local.`);
+      running = false;
+      runningStartedAt = null;
+    } else {
+      return { status: 'already-running', runningAgeMinutes: Number(runningAge.toFixed(1)) };
+    }
+  }
+
   running = true;
+  runningStartedAt = new Date();
+  const batchStartedAt = Date.now();
   const startedAt = new Date().toISOString();
   let execId = null;
+  let resumed = false;
+
   try {
     const items = await fetchMonitoredItems();
-    execId = await createRobotExecution(startedAt, items.length);
-    const expiryDemands = await generateExpiryDemands();
-    const results = [];
-    for (const item of items) {
-      let result;
-      try { result = await processItem(item); }
-      catch (err) { console.error(`[ERRO item ${item.numero_processo}]`, err); result = { item: item.assunto, processo: item.numero_processo, error: err.message }; }
-      results.push(result);
-      await saveRobotExecutionItem(execId, item, result);
+    const resumable = await getLatestResumableExecution();
+    if (resumable?.id) {
+      execId = resumable.id;
+      resumed = true;
       await updateRobotExecution(execId, {
-        processos_verificados: results.length,
+        status: 'Em andamento',
+        mensagem: 'Execução retomada automaticamente para continuar a varredura.'
+      });
+    } else {
+      execId = await createRobotExecution(startedAt, items.length);
+    }
+
+    const processedKeys = await getProcessedItemKeys(execId);
+    const pendingItems = items.filter(item => {
+      const key = robotItemKey(item);
+      return !processedKeys.has(key) && !processedKeys.has(`${item.origem}:${item.numero_processo}`);
+    });
+
+    const expiryDemands = resumed ? 0 : await generateExpiryDemands();
+    const results = [];
+    let processedInBatch = 0;
+
+    console.log(`[ROBO] ${resumed ? 'Retomando' : 'Iniciando'} execução ${execId || '(sem id)'}. Total=${items.length}; já verificados=${processedKeys.size}; pendentes=${pendingItems.length}; lote=${ROBOT_BATCH_SIZE}; orçamento=${ROBOT_TIME_BUDGET_MINUTES}min.`);
+
+    for (const item of pendingItems) {
+      if (shouldStopBatch(batchStartedAt, processedInBatch)) break;
+      const inicioItem = new Date().toISOString();
+      const itemStarted = Date.now();
+      let result;
+      try {
+        result = await processItem(item);
+      } catch (err) {
+        console.error(`[ERRO item ${item.numero_processo}]`, err);
+        result = { item: item.assunto, processo: item.numero_processo, error: err.message };
+      }
+      result.inicioItem = inicioItem;
+      result.fimItem = new Date().toISOString();
+      result.duracaoMs = Date.now() - itemStarted;
+      results.push(result);
+      processedInBatch++;
+      await saveRobotExecutionItem(execId, item, result, processedKeys.size + processedInBatch);
+
+      // Totais parciais, considerando também os itens já registrados no banco.
+      const totalVerificados = processedKeys.size + processedInBatch;
+      await updateRobotExecution(execId, {
+        processos_verificados: totalVerificados,
         processos_erro: results.filter(r => r.error).length,
         alertas_gerados: results.reduce((sum, r) => sum + Number(r.alerts || 0), 0),
-        demandas_geradas: results.reduce((sum, r) => sum + Number(r.demands || 0), 0) + expiryDemands
+        demandas_geradas: results.reduce((sum, r) => sum + Number(r.demands || 0), 0) + expiryDemands,
+        mensagem: `Varredura em andamento. Verificados ${totalVerificados}/${items.length}.`
       });
     }
-    const totals = {
-      processos_verificados: results.length,
+
+    const finalProcessedKeys = await getProcessedItemKeys(execId);
+    const totalProcessed = Math.max(finalProcessedKeys.size, processedKeys.size + processedInBatch);
+    const remaining = Math.max(0, items.length - totalProcessed);
+    const partialTotals = {
+      processos_verificados: totalProcessed,
       processos_erro: results.filter(r => r.error).length,
       alertas_gerados: results.reduce((sum, r) => sum + Number(r.alerts || 0), 0),
       demandas_geradas: results.reduce((sum, r) => sum + Number(r.demands || 0), 0) + expiryDemands
     };
-    lastResult = { startedAt, finishedAt: new Date().toISOString(), mode: MODE, version: VERSION, demandDocumentRecencyDays: DEMAND_DOCUMENT_RECENCY_DAYS, alertDocumentRecencyDays: ALERT_DOCUMENT_RECENCY_DAYS, expiryDemands, monitored: items.length, results };
-    await updateRobotExecution(execId, { fim: lastResult.finishedAt, status: totals.processos_erro ? 'Concluída com erro' : 'Concluída', ...totals, mensagem: totals.processos_erro ? 'Execução finalizada com erro em um ou mais processos.' : 'Execução concluída.' });
+
+    if (remaining > 0) {
+      lastResult = {
+        status: 'partial-resume-scheduled',
+        executionId: execId,
+        startedAt,
+        pausedAt: new Date().toISOString(),
+        mode: MODE,
+        version: VERSION,
+        monitored: items.length,
+        processed: totalProcessed,
+        remaining,
+        batchSize: ROBOT_BATCH_SIZE,
+        timeBudgetMinutes: ROBOT_TIME_BUDGET_MINUTES,
+        results
+      };
+      await updateRobotExecution(execId, {
+        status: 'Pausada para continuação',
+        ...partialTotals,
+        mensagem: `Lote concluído. Restam ${remaining} processo(s). Retomada automática agendada.`
+      });
+      scheduleSelfResume();
+      console.log(JSON.stringify(lastResult, null, 2));
+      return lastResult;
+    }
+
+    const totals = partialTotals;
+    lastResult = {
+      status: 'completed',
+      executionId: execId,
+      startedAt: resumed ? (resumable?.inicio || startedAt) : startedAt,
+      finishedAt: new Date().toISOString(),
+      mode: MODE,
+      version: VERSION,
+      demandDocumentRecencyDays: DEMAND_DOCUMENT_RECENCY_DAYS,
+      alertDocumentRecencyDays: ALERT_DOCUMENT_RECENCY_DAYS,
+      expiryDemands,
+      monitored: items.length,
+      processed: totalProcessed,
+      results
+    };
+    await updateRobotExecution(execId, {
+      fim: lastResult.finishedAt,
+      status: totals.processos_erro ? 'Concluída com erro' : 'Concluída',
+      ...totals,
+      mensagem: totals.processos_erro ? 'Execução finalizada com erro em um ou mais processos.' : 'Execução concluída.'
+    });
     console.log(JSON.stringify(lastResult, null, 2));
     return lastResult;
   } catch (err) {
     await updateRobotExecution(execId, { fim: new Date().toISOString(), status: 'Erro', mensagem: err.message });
     throw err;
-  } finally { running = false; }
+  } finally {
+    running = false;
+    runningStartedAt = null;
+  }
 }
+
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -1257,7 +1437,7 @@ function checkTriggerToken(req, res) {
   return false;
 }
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: VERSION, mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: VERSION, mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger', 'GET /reset-lock'], lastResult }));
 app.get('/health', (_req, res) => res.json({ ok: true, version: VERSION, mode: MODE, running, lastResult }));
 
 async function handleManualRun(req, res) {
@@ -1270,6 +1450,7 @@ app.post('/run', handleManualRun);
 app.get('/run', handleManualRun);
 app.post('/trigger', handleManualRun);
 app.get('/trigger', handleManualRun);
+app.get('/reset-lock', (req, res) => { if (!checkTriggerToken(req, res)) return; running = false; runningStartedAt = null; res.json({ ok: true, message: 'Trava local liberada. Se houver execução pausada no banco, o próximo /trigger vai retomá-la.' }); });
 
 if (process.argv.includes('--once')) {
   runRobot().then(() => process.exit(0)).catch(err => { console.error(err); process.exit(1); });

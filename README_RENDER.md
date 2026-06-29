@@ -1,24 +1,39 @@
-# Robô SEI NIAR v11.9 - leitura segura e alerta limpo
+# Robô SEI NIAR v14 — Varredura em lotes e retomada automática
 
-Melhorias:
-- descarta texto da árvore do processo como se fosse documento;
-- só confirma leitura quando encontra sinais confiáveis de documento;
-- assunto específico só é gerado quando houver padrão confiável como `Assunto:`, `Referência:` ou conteúdo confirmado;
-- se não conseguir ler, gera alerta seguro sem inventar assunto;
-- salva `nivel_alerta`, `leitura_confirmada`, `estrategia_leitura`, `erro_leitura` e `tentativas_leitura`.
+Esta versão evita travamento por tempo longo no Render. O robô processa os processos monitorados em lotes, registra os processos já verificados e retoma automaticamente até concluir a varredura.
 
-Start Command no Render:
+## Mantém
+- Login no SEI real;
+- leitura robusta dos documentos;
+- alerta fallback quando não conseguir ler o conteúdo;
+- regra de setor gerador do documento;
+- registro de execuções do robô.
+
+## Novas variáveis recomendadas no Render
+
+```env
+ROBOT_BATCH_SIZE=5
+ROBOT_TIME_BUDGET_MINUTES=10
+ROBOT_SELF_RESUME_DELAY_SECONDS=30
+ROBOT_EXECUTION_STALE_MINUTES=30
+```
+
+Sugestão inicial: deixar 5 processos por lote e 10 minutos por execução. Se o Render estiver estável, pode aumentar para 8 ou 10.
+
+## Start Command
+
+Mantenha:
 
 ```bash
 npx playwright install chromium && node index.js
 ```
 
-Mantenha `ROBOT_MODE=sei` para SEI real.
+## SQL
 
-## v12.0.0
+Rode no Supabase o arquivo `schema_robo_v14_lotes.sql`. Ele não apaga dados; só adiciona colunas para registrar retomada/lotes.
 
-Correções:
-- Filtra candidatos para considerar apenas documentos SEI com padrão `Tipo ... (ID)`.
-- Evita classificar `SESAU-GECONT - GERÊNCIA DE CONTRATOS` como documento do tipo Contrato.
-- Alerta passa a sair com título no padrão: `Tipo do documento (ID) inserido no processo ...`.
-- Continua salvando assunto/resumo quando a leitura for confiável.
+## Rotas
+
+- `/trigger?token=...` executa ou retoma a varredura;
+- `/reset-lock?token=...` libera a trava local do processo Node, caso fique preso em `already-running`.
+
