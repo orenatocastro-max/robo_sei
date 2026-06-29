@@ -25,7 +25,7 @@ const SEI_MAX_DOCUMENTS = Number(process.env.SEI_MAX_DOCUMENTS || 40);
 const SEI_READ_LAST_DOCUMENTS = Number(process.env.SEI_READ_LAST_DOCUMENTS || 1);
 const SEI_HEADLESS = String(process.env.SEI_HEADLESS || 'true').toLowerCase() !== 'false';
 const SEI_DEBUG = String(process.env.SEI_DEBUG || 'false').toLowerCase() === 'true';
-const VERSION = '12.0.0';
+const VERSION = '13.0.0';
 let running = false;
 let lastResult = null;
 
@@ -235,11 +235,31 @@ function anyRuleMatches(value, rules) {
   return rules.some(r => v.includes(r) || r.includes(v));
 }
 
+function extractSectorFromContext(text = '') {
+  const raw = cleanText(text || '');
+  const patterns = [
+    /(SESAU-[A-Z0-9-]{2,})/i,
+    /(HB-[A-Z0-9-]{2,})/i,
+    /(GECONT|GPACC|CREG|PGE|CAD|CGAPP|NIARCREG|NIAR)/i
+  ];
+  for (const pattern of patterns) {
+    const m = raw.match(pattern);
+    if (m?.[1]) return String(m[1]).toUpperCase();
+  }
+  return null;
+}
+
+function sectorForRule(mov = {}) {
+  // Regra definida pelo usuário deve bater com o setor/usuário que GEROU o documento na árvore do SEI,
+  // não com unidades citadas dentro do texto do documento ou destinatários.
+  return mov.setor_gerador || mov.setor_origem || mov.setor || '';
+}
+
 function ruleMatches(mov, rule) {
   const setores = splitRuleList(rule.setor_interesse || rule.setor_alerta || '');
   const tipos = splitRuleList(rule.tipo_documento_interesse || rule.tipo_documento_alerta || '');
 
-  const setorOk = anyRuleMatches(mov.setor, setores);
+  const setorOk = anyRuleMatches(sectorForRule(mov), setores);
   const tipoBase = `${mov.tipo_documento || ''} ${mov.documento || ''}`;
   const tipoOk = anyRuleMatches(tipoBase, tipos);
 
@@ -665,13 +685,24 @@ async function collectDocumentCandidates(page) {
           if (/^SESAU-|GER[ÊE]NCIA|N[ÚU]CLEO|COORDENADORIA|CONTROLE DE PROCESSOS/i.test(t)) return false;
           return true;
         };
+        const sectorFrom = (txt) => {
+          const s = String(txt || '').replace(/\s+/g, ' ').trim();
+          const m = s.match(/(SESAU-[A-Z0-9-]{2,}|HB-[A-Z0-9-]{2,}|GECONT|GPACC|CREG|PGE|CAD|CGAPP|NIARCREG|NIAR)/i);
+          return m ? String(m[1]).toUpperCase() : '';
+        };
         return els
           .filter(isVisible)
-          .map((el, idx) => ({ idx, text: (el.innerText || el.textContent || '').trim(), tag: el.tagName, href: el.href || el.getAttribute('href') || '' }))
+          .map((el, idx) => {
+            const text = (el.innerText || el.textContent || '').trim();
+            const parentText = (el.parentElement?.innerText || el.parentElement?.textContent || '').trim();
+            const rowText = (el.closest('li, tr, div')?.innerText || el.closest('li, tr, div')?.textContent || '').trim();
+            const ctx = [text, parentText, rowText].filter(Boolean).join(' ');
+            return { idx, text, tag: el.tagName, href: el.href || el.getAttribute('href') || '', contextText: ctx, setorGerador: sectorFrom(ctx) };
+          })
           .filter(x => valid(x.text))
           .filter((x, i, arr) => arr.findIndex(y => y.text === x.text) === i);
       });
-      for (const f of found) candidates.push({ frame, text: cleanText(f.text), href: f.href || '' });
+      for (const f of found) candidates.push({ frame, text: cleanText(f.text), href: f.href || '', contextText: cleanText(f.contextText || ''), setorGerador: f.setorGerador || extractSectorFromContext(f.contextText || '') });
     } catch {}
   }
 
@@ -909,13 +940,15 @@ async function getMovementsFromSEIReal(item) {
       const tipo_documento = inferDocumentType(documento);
       const read = await clickDocumentAndRead(page, cand);
       const texto = read.texto || '';
-      const setorMatch = cand.text.match(/SESAU-[A-Z0-9\-]+|GECONT|GPACC|CREG|PGE|CAD|CGAPP/i) || texto.match(/SESAU-[A-Z0-9\-]+|GECONT|GPACC|CREG|PGE|CAD|CGAPP/i);
-      const setor = setorMatch?.[0] || item.setor_interesse || item.setor_alerta || 'SEI';
+      const setorGerador = cand.setorGerador || extractSectorFromContext(cand.contextText || cand.text || '') || 'SEI';
+      const setor = setorGerador;
       const hoje = nowBR();
       const hash = `sei:${item.numero_processo}:${id_sei || documento}`;
       movements.push({
         data_movimentacao: hoje,
         setor,
+        setor_gerador: setorGerador,
+        setor_origem: setorGerador,
         tipo_documento,
         documento,
         id_sei,
@@ -989,7 +1022,7 @@ async function createDemandIfNeeded(item, movement, alerta) {
     titulo,
     status: 'Aberta',
     prioridade: 'Alta',
-    observacao: `Demanda automática gerada pelo robô SEI por novo documento/movimentação.\n\nProcesso: ${item.numero_processo}\nDocumento: ${movement.documento}\nTipo: ${movement.tipo_documento}\nSetor: ${movement.setor}\nData: ${movement.data_movimentacao}\nAssunto identificado: ${movement.assunto_identificado || alerta?.titulo || ''}\nResumo: ${movement.resumo_documento || movement.resumo || ''}\n\nVerificar o teor do documento e adotar as providências cabíveis.`
+    observacao: `Demanda automática gerada pelo robô SEI por novo documento/movimentação.\n\nProcesso: ${item.numero_processo}\nDocumento: ${movement.documento}\nTipo: ${movement.tipo_documento}\nSetor gerador: ${movement.setor_gerador || movement.setor}\nData: ${movement.data_movimentacao}\nAssunto identificado: ${movement.assunto_identificado || alerta?.titulo || ''}\nResumo: ${movement.resumo_documento || movement.resumo || ''}\n\nVerificar o teor do documento e adotar as providências cabíveis.`
   }).select('id').single();
   if (error) throw error;
   return data.id;
@@ -1088,6 +1121,8 @@ async function processItem(item) {
       tentativas_leitura: mov.tentativas_leitura || null,
       nivel_alerta: alertaInformativo ? 'informativo' : 'normal',
       setor: mov.setor,
+      setor_gerador: mov.setor_gerador || mov.setor,
+      setor_origem: mov.setor_origem || mov.setor_gerador || mov.setor,
       tipo_documento: mov.tipo_documento,
       documento: mov.documento,
       id_sei: mov.id_sei || null,
@@ -1118,21 +1153,88 @@ async function processItem(item) {
   return { item: item.assunto, processo: item.numero_processo, movementsFound: movements.length, newMovements, alerts, demands };
 }
 
+
+async function createRobotExecution(startedAt, itemsLength) {
+  try {
+    const { data, error } = await supabase.from('robo_execucoes').insert({
+      inicio: startedAt,
+      status: 'Em andamento',
+      modo: MODE,
+      processos_monitorados: itemsLength || 0,
+      processos_verificados: 0,
+      processos_erro: 0,
+      alertas_gerados: 0,
+      demandas_geradas: 0,
+      mensagem: 'Execução iniciada pelo robô SEI.'
+    }).select('id').single();
+    if (error) throw error;
+    return data?.id || null;
+  } catch (err) {
+    console.warn('[ROBO] Não foi possível registrar execução no Supabase:', err.message);
+    return null;
+  }
+}
+
+async function updateRobotExecution(execId, patch) {
+  if (!execId) return;
+  try { await supabase.from('robo_execucoes').update(patch).eq('id', execId); }
+  catch (err) { console.warn('[ROBO] Falha ao atualizar execução:', err.message); }
+}
+
+async function saveRobotExecutionItem(execId, item, result) {
+  if (!execId) return;
+  try {
+    await supabase.from('robo_execucao_itens').insert({
+      execucao_id: execId,
+      item_nome: item.assunto || item.prestador || item.numero_processo,
+      numero_processo: item.numero_processo,
+      origem: item.origem,
+      status: result.error ? 'Erro' : 'Verificado',
+      mensagem: result.error || (result.newMovements ? 'Movimentação nova identificada' : 'Sem novidade'),
+      documento: result.documento || null,
+      movimentos: result.newMovements || 0,
+      alertas: result.alerts || 0,
+      demandas: result.demands || 0
+    });
+  } catch (err) { console.warn('[ROBO] Falha ao registrar item da execução:', err.message); }
+}
+
 export async function runRobot() {
   if (running) return { status: 'already-running' };
   running = true;
   const startedAt = new Date().toISOString();
+  let execId = null;
   try {
-    const expiryDemands = await generateExpiryDemands();
     const items = await fetchMonitoredItems();
+    execId = await createRobotExecution(startedAt, items.length);
+    const expiryDemands = await generateExpiryDemands();
     const results = [];
     for (const item of items) {
-      try { results.push(await processItem(item)); }
-      catch (err) { console.error(`[ERRO item ${item.numero_processo}]`, err); results.push({ item: item.assunto, processo: item.numero_processo, error: err.message }); }
+      let result;
+      try { result = await processItem(item); }
+      catch (err) { console.error(`[ERRO item ${item.numero_processo}]`, err); result = { item: item.assunto, processo: item.numero_processo, error: err.message }; }
+      results.push(result);
+      await saveRobotExecutionItem(execId, item, result);
+      await updateRobotExecution(execId, {
+        processos_verificados: results.length,
+        processos_erro: results.filter(r => r.error).length,
+        alertas_gerados: results.reduce((sum, r) => sum + Number(r.alerts || 0), 0),
+        demandas_geradas: results.reduce((sum, r) => sum + Number(r.demands || 0), 0) + expiryDemands
+      });
     }
-    lastResult = { startedAt, finishedAt: new Date().toISOString(), mode: MODE, demandDocumentRecencyDays: DEMAND_DOCUMENT_RECENCY_DAYS, alertDocumentRecencyDays: ALERT_DOCUMENT_RECENCY_DAYS, expiryDemands, monitored: items.length, results };
+    const totals = {
+      processos_verificados: results.length,
+      processos_erro: results.filter(r => r.error).length,
+      alertas_gerados: results.reduce((sum, r) => sum + Number(r.alerts || 0), 0),
+      demandas_geradas: results.reduce((sum, r) => sum + Number(r.demands || 0), 0) + expiryDemands
+    };
+    lastResult = { startedAt, finishedAt: new Date().toISOString(), mode: MODE, version: VERSION, demandDocumentRecencyDays: DEMAND_DOCUMENT_RECENCY_DAYS, alertDocumentRecencyDays: ALERT_DOCUMENT_RECENCY_DAYS, expiryDemands, monitored: items.length, results };
+    await updateRobotExecution(execId, { fim: lastResult.finishedAt, status: totals.processos_erro ? 'Concluída com erro' : 'Concluída', ...totals, mensagem: totals.processos_erro ? 'Execução finalizada com erro em um ou mais processos.' : 'Execução concluída.' });
     console.log(JSON.stringify(lastResult, null, 2));
     return lastResult;
+  } catch (err) {
+    await updateRobotExecution(execId, { fim: new Date().toISOString(), status: 'Erro', mensagem: err.message });
+    throw err;
   } finally { running = false; }
 }
 
@@ -1155,8 +1257,8 @@ function checkTriggerToken(req, res) {
   return false;
 }
 
-app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: '11.9.0', mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
-app.get('/health', (_req, res) => res.json({ ok: true, version: '11.9.0', mode: MODE, running, lastResult }));
+app.get('/', (_req, res) => res.json({ ok: true, service: 'Robô SEI NIAR', version: VERSION, mode: MODE, running, endpoints: ['GET /health', 'GET /run', 'POST /run', 'GET /trigger', 'POST /trigger'], lastResult }));
+app.get('/health', (_req, res) => res.json({ ok: true, version: VERSION, mode: MODE, running, lastResult }));
 
 async function handleManualRun(req, res) {
   if (!checkTriggerToken(req, res)) return;
