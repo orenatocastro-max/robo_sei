@@ -25,7 +25,7 @@ const SEI_MAX_DOCUMENTS = Number(process.env.SEI_MAX_DOCUMENTS || 40);
 const SEI_READ_LAST_DOCUMENTS = Number(process.env.SEI_READ_LAST_DOCUMENTS || 1);
 const SEI_HEADLESS = String(process.env.SEI_HEADLESS || 'true').toLowerCase() !== 'false';
 const SEI_DEBUG = String(process.env.SEI_DEBUG || 'false').toLowerCase() === 'true';
-const VERSION = '14.0.0';
+const VERSION = '15.0.0';
 const ROBOT_BATCH_SIZE = Number(process.env.ROBOT_BATCH_SIZE || 5);
 const ROBOT_TIME_BUDGET_MINUTES = Number(process.env.ROBOT_TIME_BUDGET_MINUTES || 10);
 const ROBOT_SELF_RESUME_DELAY_SECONDS = Number(process.env.ROBOT_SELF_RESUME_DELAY_SECONDS || 30);
@@ -129,8 +129,10 @@ function summarizeDocumentText(text = '', movement = {}) {
 
 function parseDocumentName(text = '') {
   const t = cleanText(text);
-  const m = t.match(/^(.+?)\s*\((\d+)\)/);
+  const m = t.match(/^(.+?)\s*\((\d{5,})\)/);
   if (m) return { documento: cleanText(m[1]), id_sei: m[2] };
+  const m2 = t.match(/^(Informação|Informacao|Despacho|Ofício|Oficio|Memorando|Parecer|Anexo|Contrato|Termo\s+Aditivo|Termo\s+de\s+Referência|Termo\s+de\s+Referencia|Nota\s+Técnica|Nota\s+Tecnica|Portaria|Certidão|Certidao|Consulta|Comunicação|Comunicacao)\s*(.*?)\s+(\d{6,})$/i);
+  if (m2) return { documento: cleanText(`${m2[1]} ${m2[2] || ''}`), id_sei: m2[3] };
   return { documento: t, id_sei: null };
 }
 
@@ -1246,9 +1248,8 @@ async function getProcessedItemKeys(execId) {
   try {
     const { data, error } = await supabase
       .from('robo_execucao_itens')
-      .select('item_key,origem,numero_processo,status')
-      .eq('execucao_id', execId)
-      .neq('status', 'Erro');
+      .select('item_key,origem,numero_processo,status,alertas,demandas')
+      .eq('execucao_id', execId);
     if (error) throw error;
     const keys = new Set();
     for (const row of data || []) {
@@ -1259,6 +1260,27 @@ async function getProcessedItemKeys(execId) {
   } catch (err) {
     console.warn('[ROBO] Não foi possível recuperar itens já verificados:', err.message);
     return new Set();
+  }
+}
+
+async function getExecutionItemStats(execId) {
+  if (!execId) return { verificados: 0, erros: 0, alertas: 0, demandas: 0 };
+  try {
+    const { data, error } = await supabase
+      .from('robo_execucao_itens')
+      .select('status,alertas,demandas')
+      .eq('execucao_id', execId);
+    if (error) throw error;
+    return (data || []).reduce((acc, row) => {
+      acc.verificados += 1;
+      if (String(row.status || '').toLowerCase().includes('erro')) acc.erros += 1;
+      acc.alertas += Number(row.alertas || 0);
+      acc.demandas += Number(row.demandas || 0);
+      return acc;
+    }, { verificados: 0, erros: 0, alertas: 0, demandas: 0 });
+  } catch (err) {
+    console.warn('[ROBO] Não foi possível consolidar estatísticas da execução:', err.message);
+    return { verificados: 0, erros: 0, alertas: 0, demandas: 0 };
   }
 }
 
@@ -1340,24 +1362,25 @@ export async function runRobot(options = {}) {
       await saveRobotExecutionItem(execId, item, result, processedKeys.size + processedInBatch);
 
       // Totais parciais, considerando também os itens já registrados no banco.
-      const totalVerificados = processedKeys.size + processedInBatch;
+      const statsParciais = await getExecutionItemStats(execId);
       await updateRobotExecution(execId, {
-        processos_verificados: totalVerificados,
-        processos_erro: results.filter(r => r.error).length,
-        alertas_gerados: results.reduce((sum, r) => sum + Number(r.alerts || 0), 0),
-        demandas_geradas: results.reduce((sum, r) => sum + Number(r.demands || 0), 0) + expiryDemands,
-        mensagem: `Varredura em andamento. Verificados ${totalVerificados}/${items.length}.`
+        processos_verificados: statsParciais.verificados,
+        processos_erro: statsParciais.erros,
+        alertas_gerados: statsParciais.alertas,
+        demandas_geradas: statsParciais.demandas + expiryDemands,
+        mensagem: `Varredura em andamento. Verificados ${statsParciais.verificados}/${items.length}.`
       });
     }
 
     const finalProcessedKeys = await getProcessedItemKeys(execId);
-    const totalProcessed = Math.max(finalProcessedKeys.size, processedKeys.size + processedInBatch);
+    const totalProcessed = finalProcessedKeys.size;
     const remaining = Math.max(0, items.length - totalProcessed);
+    const statsFinais = await getExecutionItemStats(execId);
     const partialTotals = {
-      processos_verificados: totalProcessed,
-      processos_erro: results.filter(r => r.error).length,
-      alertas_gerados: results.reduce((sum, r) => sum + Number(r.alerts || 0), 0),
-      demandas_geradas: results.reduce((sum, r) => sum + Number(r.demands || 0), 0) + expiryDemands
+      processos_verificados: statsFinais.verificados,
+      processos_erro: statsFinais.erros,
+      alertas_gerados: statsFinais.alertas,
+      demandas_geradas: statsFinais.demandas + expiryDemands
     };
 
     if (remaining > 0) {
