@@ -25,7 +25,7 @@ const SEI_MAX_DOCUMENTS = Number(process.env.SEI_MAX_DOCUMENTS || 40);
 const SEI_READ_LAST_DOCUMENTS = Number(process.env.SEI_READ_LAST_DOCUMENTS || 1);
 const SEI_HEADLESS = String(process.env.SEI_HEADLESS || 'true').toLowerCase() !== 'false';
 const SEI_DEBUG = String(process.env.SEI_DEBUG || 'false').toLowerCase() === 'true';
-const VERSION = '15.0.0';
+const VERSION = '15.8.0';
 const ROBOT_BATCH_SIZE = Number(process.env.ROBOT_BATCH_SIZE || 5);
 const ROBOT_TIME_BUDGET_MINUTES = Number(process.env.ROBOT_TIME_BUDGET_MINUTES || 10);
 const ROBOT_SELF_RESUME_DELAY_SECONDS = Number(process.env.ROBOT_SELF_RESUME_DELAY_SECONDS || 30);
@@ -61,6 +61,32 @@ function looksLikeProcessTreeText(text = '') {
   const hasTreeTerms = n.includes('controle de processos') || n.includes('processos recebidos') || n.includes('processos gerados') || n.includes('acompanhamento especial');
   const lacksDocumentHeader = !/(governo do estado|secretaria|núcleo|nucleo|assunto\s*:|refer[êe]ncia\s*:|ao senhor|senhor\(a\)|despacho|informa[cç][aã]o\s*n[ºo])/i.test(clean);
   return hasTreeTerms || romanSeq || (manyDocNames && manyIds && lacksDocumentHeader);
+}
+
+
+function buildAlertEventKey(item = {}, mov = {}) {
+  const parts = [
+    item.numero_processo || '',
+    mov.id_sei || '',
+    mov.tipo_documento || '',
+    mov.documento || '',
+    mov.setor_gerador || mov.setor || ''
+  ];
+  return parts.map(v => String(v || '').trim().toLowerCase()).join('|');
+}
+
+async function alertaJaRegistrado(alertEventKey) {
+  if (!alertEventKey) return false;
+  const { data, error } = await supabase
+    .from('processo_alertas')
+    .select('id,status')
+    .eq('alert_event_key', alertEventKey)
+    .maybeSingle();
+  if (error) {
+    if (String(error.message || '').toLowerCase().includes('alert_event_key')) return false;
+    throw error;
+  }
+  return !!data?.id;
 }
 
 function formatDocumentRef(movement = {}) {
@@ -1107,6 +1133,11 @@ async function processItem(item) {
     }
 
     const source_hash = `alert:${mov.hash_movimentacao}`;
+    const alertEventKey = buildAlertEventKey(item, mov);
+    if (await alertaJaRegistrado(alertEventKey)) {
+      console.log(`[SEI] Alerta já tratado/registrado, não recriando: ${alertEventKey}`);
+      continue;
+    }
     const primeiraLeitura = !hadPrevious;
     const podeGerarDemanda = !!item.gerar_demanda && !primeiraLeitura && recentForDemand && matches;
     const prefixoInformativo = alertaInformativo ? '[INFORMATIVO] ' : '';
@@ -1135,6 +1166,7 @@ async function processItem(item) {
       id_sei: mov.id_sei || null,
       data_movimentacao: mov.data_movimentacao,
       source_hash,
+      alert_event_key: alertEventKey,
       status: 'Pendente',
       gerar_demanda: podeGerarDemanda
     };
